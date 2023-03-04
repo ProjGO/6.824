@@ -6,8 +6,11 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+	"time"
+)
 
 //
 // example to show how to declare the arguments
@@ -23,7 +26,31 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type TaskType uint32
 
+const (
+	MAP      TaskType = iota
+	REDUCE   TaskType = iota
+	TRYAGAIN TaskType = iota // there are no task now, but there may be more after a while, e.g. a task assigned to a crushed worker has been added to "TODO" queue again
+	NOMORE   TaskType = iota
+)
+
+type Task struct {
+	// a global Id used to identify a task uniquely
+	GId uint32
+
+	TType TaskType
+	// Id of mapper/reducer
+	Id        uint32
+	StartTime time.Time
+
+	InputFilenames []string
+
+	workerId uint32
+
+	M uint32
+	R uint32
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
