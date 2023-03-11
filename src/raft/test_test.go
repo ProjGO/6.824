@@ -63,23 +63,23 @@ func TestReElection2A(t *testing.T) {
 
 	// if the leader disconnects, a new one should be elected.
 	cfg.disconnect(leader1)
-	DPrintf("TEST: %v is disconnected", leader1)
+	TPrintf("TEST: %v is disconnected", leader1)
 	cfg.checkOneLeader()
 
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader. and the old leader
 	// should switch to follower.
 	cfg.connect(leader1)
-	DPrintf("TEST: %v is reconnected", leader1)
+	TPrintf("Server %v is reconnected", leader1)
 	leader2 := cfg.checkOneLeader()
 
 	// if there's no quorum, no new leader should
 	// be elected.
 	cfg.disconnect(leader2)
 	cfg.disconnect((leader2 + 1) % servers)
-	DPrintf("TEST: %v, %v are disconnected", leader2, (leader2+1)%servers)
+	TPrintf("Server %v, %v are disconnected", leader2, (leader2+1)%servers)
 	time.Sleep(2 * RaftElectionTimeout)
-	DPrintf("%v", cfg.connected)
+	TPrintf("%v", cfg.connected)
 
 	// check that the one connected server
 	// does not think it is the leader.
@@ -87,12 +87,12 @@ func TestReElection2A(t *testing.T) {
 
 	// if a quorum arises, it should elect a leader.
 	cfg.connect((leader2 + 1) % servers)
-	DPrintf("TEST: %v is reconnected", (leader2+1)%servers)
+	TPrintf("Server %v is reconnected", (leader2+1)%servers)
 	cfg.checkOneLeader()
 
 	// re-join of last node shouldn't prevent leader from existing.
 	cfg.connect(leader2)
-	DPrintf("TEST: %v is reconnected", leader2)
+	TPrintf("Server %v is reconnected", leader2)
 	cfg.checkOneLeader()
 
 	cfg.end()
@@ -506,44 +506,60 @@ func TestBackup2B(t *testing.T) {
 	cfg.begin("Test (2B): leader backs up quickly over incorrect follower logs")
 
 	cfg.one(rand.Int(), servers, true)
+	TPrintf("-----1")
 
 	// put leader and one follower in a partition
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
+	muteServer((leader1 + 2) % servers)
+	muteServer((leader1 + 3) % servers)
+	muteServer((leader1 + 4) % servers)
 
 	// submit lots of commands that won't commit
 	for i := 0; i < 50; i++ {
-		cfg.rafts[leader1].Start(rand.Int())
+		// cfg.rafts[leader1].Start(rand.Int())
+		cfg.rafts[leader1].Start(rand.Int() % 1000)
 	}
 
 	time.Sleep(RaftElectionTimeout / 2)
 
 	cfg.disconnect((leader1 + 0) % servers)
 	cfg.disconnect((leader1 + 1) % servers)
+	muteServer((leader1 + 0) % servers)
+	muteServer((leader1 + 1) % servers)
 
 	// allow other partition to recover
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
+	unmuteServer((leader1 + 2) % servers)
+	unmuteServer((leader1 + 3) % servers)
+	unmuteServer((leader1 + 4) % servers)
 
 	// lots of successful commands to new group.
+	TPrintf("-----2")
 	for i := 0; i < 50; i++ {
-		cfg.one(rand.Int(), 3, true)
+		// cfg.one(rand.Int(), 3, true)
+		cfg.one(rand.Int()%1000, 3, true)
+		TPrintf("%d", i)
 	}
 
 	// now another partitioned leader and one follower
 	leader2 := cfg.checkOneLeader()
+	TPrintf("-----3")
 	other := (leader1 + 2) % servers
 	if leader2 == other {
 		other = (leader2 + 1) % servers
 	}
 	cfg.disconnect(other)
+	muteServer(other)
 
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
-		cfg.rafts[leader2].Start(rand.Int())
+		// cfg.rafts[leader2].Start(rand.Int())
+		cfg.rafts[leader2].Start(rand.Int() % 1000)
 	}
 
 	time.Sleep(RaftElectionTimeout / 2)
@@ -551,21 +567,32 @@ func TestBackup2B(t *testing.T) {
 	// bring original leader back to life,
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
+		muteServer(i)
 	}
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
+	unmuteServer((leader1 + 0) % servers)
+	unmuteServer((leader1 + 1) % servers)
+	unmuteServer(other)
 
 	// lots of successful commands to new group.
+	TPrintf("-----4")
 	for i := 0; i < 50; i++ {
-		cfg.one(rand.Int(), 3, true)
+		num := rand.Int() % 1000
+		TPrintf("one(%d)", num)
+		// cfg.one(rand.Int(), 3, true)
+		cfg.one(num, 3, true)
 	}
 
 	// now everyone
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
+		unmuteServer(i)
 	}
-	cfg.one(rand.Int(), servers, true)
+	// cfg.one(rand.Int(), servers, true)
+	cfg.one(rand.Int()%1000, servers, true)
+	TPrintf("-----5")
 
 	cfg.end()
 }
