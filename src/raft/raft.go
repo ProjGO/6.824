@@ -20,12 +20,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -127,13 +129,18 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	DPrintf(dInfo, rf.me, "persist")
+	if rf.mu.TryLock() {
+		defer rf.mu.Unlock()
+	}
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -141,19 +148,24 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
+
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []Entry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		DPrintf(dError, rf.me, "Failed to readPersist")
+		return
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -217,6 +229,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		DPrintf(dVote, rf.me, "vote to %v is NOT granted, rf.votedFor: %v, upToDate: %v", args.CandidateId, rf.votedFor, upToDate)
 	}
+
+	rf.persist()
 
 	reply.Term = rf.currentTerm
 }
@@ -309,6 +323,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
+	rf.persist()
+
 	// if leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, rf.log[len(rf.log)-1].Index)
@@ -343,7 +359,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := len(rf.log)
 	entry := Entry{Term: term, Index: index, Command: command}
 	rf.log = append(rf.log, entry)
-	// rf.sendAppendEntries()
+
+	rf.persist()
 
 	DPrintf(dInfo, rf.me, "Start: receives a new command[%v] to replicate in term %v", command, rf.currentTerm)
 
@@ -390,6 +407,8 @@ func (rf *Raft) ticker() {
 				rf.currentTerm++
 				rf.votedFor = HAVNTVOTED
 				rf.voteRequested = false
+
+				rf.persist()
 			}
 
 		case CANDIDATE:
@@ -402,6 +421,8 @@ func (rf *Raft) ticker() {
 				rf.currentTerm++
 				rf.votedFor = HAVNTVOTED
 				rf.voteRequested = false
+
+				rf.persist()
 			}
 
 			if !rf.voteRequested {
@@ -423,6 +444,7 @@ func (rf *Raft) ticker() {
 					// done.Add(1)
 					if i == rf.me {
 						rf.votedFor = rf.me
+						rf.persist()
 						votedCnt++
 						continue
 					}
@@ -454,6 +476,7 @@ func (rf *Raft) ticker() {
 							DPrintf(dVote, rf.me, "Received requestVoteReply with larger term %d (current %d)", reply.Term, rf.currentTerm)
 							rf.currentTerm = reply.Term
 							rf.votedFor = HAVNTVOTED
+							rf.persist()
 						}
 						rf.mu.Unlock()
 					}(i)
@@ -524,6 +547,8 @@ func (rf *Raft) sendAppendEntries(peerIdx int, args *AppendEntriesArgs) {
 		rf.votedFor = HAVNTVOTED
 		rf.timeLastInhibitionReceived = time.Now()
 
+		rf.persist()
+
 		return
 	}
 	if reply.Success {
@@ -544,11 +569,16 @@ func (rf *Raft) sendAppendEntries(peerIdx int, args *AppendEntriesArgs) {
 			if lastIndexInXTerm > 0 {
 				lastIndexInXTerm--
 			}
-			if lastIndexInXTerm > 0 {
+			if lastIndexInXTerm >= 0 && lastIndexInXTerm < len(rf.log) && rf.log[lastIndexInXTerm].Term == reply.XTerm {
 				// leader has XTerm
+				DPrintf(dInfo, rf.me, "leader has XTerm %d, lastIndexInXTerm: %d", reply.XTerm, lastIndexInXTerm)
+				if lastIndexInXTerm == 0 {
+					lastIndexInXTerm = 1
+				}
 				rf.nextIndex[peerIdx] = lastIndexInXTerm
 			} else {
 				// leader doesn't have have XTerm
+				DPrintf(dInfo, rf.me, "leader DOESN'T has XTerm %d, lastIndexInXTerm: %d", reply.XTerm, lastIndexInXTerm)
 				rf.nextIndex[peerIdx] = reply.XIndex
 			}
 		}
