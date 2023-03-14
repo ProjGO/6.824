@@ -35,10 +35,10 @@ const (
 )
 
 func init() {
-	// debugVerbosity = 0
-	// testVerbosity = 0
-	debugVerbosity = 1
-	testVerbosity = 1
+	debugVerbosity = 0
+	testVerbosity = 0
+	// debugVerbosity = 1
+	// testVerbosity = 1
 	mutedServer = make(map[int]bool)
 	debugStart = time.Now()
 

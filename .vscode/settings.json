@@ -1,4 +1,5 @@
 {
-    // "go.testFlags": ["-v", "-count=1", "-race"] 
-    "go.testFlags": ["-v", "-count=1"] 
+    "go.testFlags": ["-v", "-count=1", "-race"], 
+    // "go.testFlags": ["-v", "-count=1"], 
+    "go.testTimeout": "1000s"
 }

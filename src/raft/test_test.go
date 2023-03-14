@@ -513,9 +513,9 @@ func TestBackup2B(t *testing.T) {
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
-	muteServer((leader1 + 2) % servers)
-	muteServer((leader1 + 3) % servers)
-	muteServer((leader1 + 4) % servers)
+	// muteServer((leader1 + 2) % servers)
+	// muteServer((leader1 + 3) % servers)
+	// muteServer((leader1 + 4) % servers)
 
 	// submit lots of commands that won't commit
 	for i := 0; i < 50; i++ {
@@ -527,16 +527,16 @@ func TestBackup2B(t *testing.T) {
 
 	cfg.disconnect((leader1 + 0) % servers)
 	cfg.disconnect((leader1 + 1) % servers)
-	muteServer((leader1 + 0) % servers)
-	muteServer((leader1 + 1) % servers)
+	// muteServer((leader1 + 0) % servers)
+	// muteServer((leader1 + 1) % servers)
 
 	// allow other partition to recover
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
-	unmuteServer((leader1 + 2) % servers)
-	unmuteServer((leader1 + 3) % servers)
-	unmuteServer((leader1 + 4) % servers)
+	// unmuteServer((leader1 + 2) % servers)
+	// unmuteServer((leader1 + 3) % servers)
+	// unmuteServer((leader1 + 4) % servers)
 
 	// lots of successful commands to new group.
 	TPrintf("-----2")
@@ -554,7 +554,7 @@ func TestBackup2B(t *testing.T) {
 		other = (leader2 + 1) % servers
 	}
 	cfg.disconnect(other)
-	muteServer(other)
+	// muteServer(other)
 
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
@@ -567,14 +567,14 @@ func TestBackup2B(t *testing.T) {
 	// bring original leader back to life,
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
-		muteServer(i)
+		// muteServer(i)
 	}
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
-	unmuteServer((leader1 + 0) % servers)
-	unmuteServer((leader1 + 1) % servers)
-	unmuteServer(other)
+	// unmuteServer((leader1 + 0) % servers)
+	// unmuteServer((leader1 + 1) % servers)
+	// unmuteServer(other)
 
 	// lots of successful commands to new group.
 	TPrintf("-----4")
@@ -588,7 +588,7 @@ func TestBackup2B(t *testing.T) {
 	// now everyone
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
-		unmuteServer(i)
+		// unmuteServer(i)
 	}
 	// cfg.one(rand.Int(), servers, true)
 	cfg.one(rand.Int()%1000, servers, true)
@@ -844,15 +844,21 @@ func TestFigure82C(t *testing.T) {
 
 	cfg.begin("Test (2C): Figure 8")
 
-	cfg.one(rand.Int(), 1, true)
+	// cfg.one(rand.Int(), 1, true)
+	cfg.one(rand.Int()%1000, 1, true)
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
+		TPrintf("-----%d", iters)
 		leader := -1
 		for i := 0; i < servers; i++ {
 			if cfg.rafts[i] != nil {
-				_, _, ok := cfg.rafts[i].Start(rand.Int())
+				// _, _, ok := cfg.rafts[i].Start(rand.Int())
+				val := rand.Int() % 1000
+				TPrintf("start(%v)", val)
+				_, _, ok := cfg.rafts[i].Start(val)
 				if ok {
+					TPrintf("start(%v): ok", val)
 					leader = i
 				}
 			}
@@ -888,7 +894,10 @@ func TestFigure82C(t *testing.T) {
 		}
 	}
 
-	cfg.one(rand.Int(), servers, true)
+	TPrintf("-----all servers are connected again")
+
+	// cfg.one(rand.Int(), servers, true)
+	cfg.one(rand.Int()%1000, servers, true)
 
 	cfg.end()
 }
