@@ -163,7 +163,14 @@ type Raft struct {
 	electionTimeout            time.Duration
 	timeLastElectionStarted    time.Time
 	newElectionTimeout         time.Duration
-	intervalHeartbeat          time.Duration
+	// interval of scaning and deciding whether to send 'appendEntries' RPC to peer
+	intervalHeartbeatScan time.Duration
+
+	// send heartbeat if: time since last hb >= maxInterval || #entries to send >= minNumEntries
+	// currently minNum is set to 0 (send appendEntries immediately as there is any entry to append)
+	minNumEntriesToSendHeartbeat int
+	maxIntervalHeartbeat         time.Duration
+	timeLastHeartbeatSentToPeer  []time.Time
 
 	CurrentTerm int
 	VotedFor    int
@@ -531,6 +538,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	DPrintf(dInfo, rf.me, "Start: receives a new command[%v] to replicate in term %v", command, rf.CurrentTerm)
 
+	// rf.mu.Unlock()
+	// rf.appendEntries()
+	// rf.mu.Lock()
+
 	return index, term, isLeader
 }
 
@@ -718,7 +729,7 @@ func (rf *Raft) appendEntries() {
 			nextIndex = rf.Log.LastIncludedEntry.Index + 1
 			prevLog = rf.Log.LastIncludedEntry
 		} else {
-			DPrintf(dInfo, rf.me, "123456: %d %d", i, nextIndex)
+			// DPrintf(dInfo, rf.me, "123456: %d %d", i, nextIndex)
 			prevLog = rf.Log.at(nextIndex - 1)
 		}
 		appendEntriesArgs.PrevLogTerm = prevLog.Term
@@ -726,13 +737,25 @@ func (rf *Raft) appendEntries() {
 
 		// if last log index >= nextIndex for a follower:
 		// send AppendEntries RPC with log entries starting at nextIndex
-		if lastLog := rf.Log.last(); lastLog.Index >= nextIndex {
+		// if lastLog := rf.Log.last(); lastLog.Index >= nextIndex {
+		// 	DPrintf(dInfo, rf.me, "appending log [%d,%d]", nextIndex, lastLog.Index)
+		// 	appendEntriesArgs.Entries = make([]Entry, lastLog.Index-nextIndex+1)
+		// 	copy(appendEntriesArgs.Entries, rf.Log.getAfter(nextIndex))
+		// }
+
+		timeCond := time.Since(rf.timeLastHeartbeatSentToPeer[i]) > rf.maxIntervalHeartbeat
+		lastLog := rf.Log.last()
+		numCond := lastLog.Index-nextIndex >= rf.minNumEntriesToSendHeartbeat
+
+		toSend := timeCond || numCond
+		if toSend || installSnapshotArgs != nil {
 			DPrintf(dInfo, rf.me, "appending log [%d,%d]", nextIndex, lastLog.Index)
 			appendEntriesArgs.Entries = make([]Entry, lastLog.Index-nextIndex+1)
 			copy(appendEntriesArgs.Entries, rf.Log.getAfter(nextIndex))
-		}
 
-		go rf.sendAppendEntries(i, appendEntriesArgs, installSnapshotArgs)
+			rf.timeLastHeartbeatSentToPeer[i] = time.Now()
+			go rf.sendAppendEntries(i, appendEntriesArgs, installSnapshotArgs)
+		}
 	}
 }
 
@@ -860,7 +883,7 @@ func (rf *Raft) sendHeartbeatDaemon() {
 			rf.appendEntries()
 		}
 
-		time.Sleep(rf.intervalHeartbeat)
+		time.Sleep(rf.intervalHeartbeatScan)
 	}
 }
 
@@ -923,7 +946,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.timeLastElectionStarted = time.Now()
 	rf.electionTimeout = time.Duration((1000 + rand.Int63()%300)) * time.Millisecond
 	rf.newElectionTimeout = 500 * time.Millisecond
-	rf.intervalHeartbeat = 150 * time.Millisecond
+	// rf.intervalHeartbeatScan = 150 * time.Millisecond // TestSpeed3A would failed
+	// rf.intervalHeartbeat = 15 * time.Millisecond  // TestCount2B would failed
+	// rf.intervalHeartbeat = 50 * time.Millisecond
+	rf.intervalHeartbeatScan = 15 * time.Millisecond
+	rf.maxIntervalHeartbeat = 150 * time.Millisecond
+	rf.minNumEntriesToSendHeartbeat = 0
+	rf.timeLastHeartbeatSentToPeer = make([]time.Time, n)
+
 	rf.matchIndex = make([]int, n)
 	rf.nextIndex = make([]int, n)
 	rf.lastApplied = 0
@@ -932,6 +962,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	for i := 0; i < len(peers); i++ {
 		rf.matchIndex[i] = 0
 		rf.nextIndex[i] = 1
+
+		rf.timeLastHeartbeatSentToPeer[i] = time.Now()
 	}
 
 	rf.CurrentTerm = 1

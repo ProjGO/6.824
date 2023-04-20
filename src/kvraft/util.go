@@ -1,4 +1,4 @@
-package raft
+package kvraft
 
 import (
 	"fmt"
@@ -13,25 +13,25 @@ var testVerbosity int
 
 var mutedServer map[int]bool
 
+const (
+	dServer int = -1
+	dClient int = -2
+)
+
 type logTopic string
 
 const (
-	dClient  logTopic = "CLNT"
-	dCommit  logTopic = "CMIT"
-	dDrop    logTopic = "DROP"
-	dError   logTopic = "ERRO"
-	dInfo    logTopic = "INFO"
-	dLeader  logTopic = "LEAD"
-	dLog     logTopic = "LOG1"
-	dLog2    logTopic = "LOG2"
-	dPersist logTopic = "PERS"
-	dSnap    logTopic = "SNAP"
-	dTerm    logTopic = "TERM"
-	dTest    logTopic = "TEST"
-	dTimer   logTopic = "TIMR"
-	dTrace   logTopic = "TRCE"
-	dVote    logTopic = "VOTE"
-	dWarn    logTopic = "WARN"
+	dError logTopic = "ERRO"
+	dWarn  logTopic = "WARN"
+	dInfo  logTopic = "INFO"
+	dLog   logTopic = "LOG1"
+	dLog2  logTopic = "LOG2"
+
+	dReq logTopic = "RQST"
+	dRsp logTopic = "RESP"
+
+	dSnap logTopic = "SNAP"
+	dTest logTopic = "TEST"
 )
 
 func init() {
@@ -53,16 +53,25 @@ func unmuteServer(id int) {
 	mutedServer[id] = false
 }
 
-func DPrintf(topic logTopic, serverId int, format string, a ...interface{}) {
-	isMuted, ok := mutedServer[serverId]
-	if ok && isMuted {
-		return
+// hostId == -1 (<0) -> log from client
+// hostId >= 0 -> log from server
+func DPrintf(topic logTopic, role int, hostId int, format string, a ...interface{}) {
+	if hostId >= 0 {
+		isMuted, ok := mutedServer[hostId]
+		if ok && isMuted {
+			return
+		}
 	}
 
 	if debugVerbosity >= 1 {
 		time := time.Since(debugStart).Microseconds()
 		time /= 100
-		prefix := fmt.Sprintf("%06d RAFT %v Server %d ", time, string(topic), serverId)
+		prefix := ""
+		if role == dServer {
+			prefix = fmt.Sprintf("%06d CLRK %v Server %d ", time, string(topic), hostId)
+		} else if role == dClient {
+			prefix = fmt.Sprintf("%06d CLRK %v Client %d ", time, string(topic), hostId%10000)
+		}
 		format = prefix + format
 
 		log.Printf(format, a...)

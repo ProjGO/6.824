@@ -1,28 +1,25 @@
 package kvraft
 
 import (
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
-	"log"
-	"sync"
-	"sync/atomic"
 )
-
-const Debug = false
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
-}
-
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	CId int
+	Seq int64
+
+	Type  string
+	Key   string
+	Value string
 }
 
 type KVServer struct {
@@ -35,15 +32,104 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	db         map[string]string
+	idx2OpChan map[int]chan Op
+	curMaxSeq  map[int]int64
 }
 
+func (kv *KVServer) Request(args *Args, reply *Reply) {
+	DPrintf(dInfo, dServer, kv.me, "received new request: %v", args)
+	kv.mu.Lock()
+	if _, ok := kv.curMaxSeq[args.CId]; !ok {
+		kv.curMaxSeq[args.CId] = -1
+	}
+	if args.Seq <= kv.curMaxSeq[args.CId] {
+		DPrintf(dInfo, dServer, kv.me, "but args.Seq (%v) <= kv.curMaxSeq[%v] (%v)", args.Seq, args.CId, kv.curMaxSeq[args.CId])
+		reply.Err = OK
+		reply.Value = kv.db[args.Key]
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
 
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	op := Op{
+		CId: args.CId,
+		Seq: args.Seq,
+
+		Type:  args.OpType,
+		Key:   args.Key,
+		Value: args.Value,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		DPrintf(dError, dServer, kv.me, "%v failed, Key: %v, ErrWrongLeader", args.OpType, args.Key)
+		return
+	}
+
+	kv.mu.Lock()
+	kv.idx2OpChan[index] = make(chan Op)
+	ch := kv.idx2OpChan[index]
+	kv.mu.Unlock()
+	select {
+	// case appliedOp := <-kv.idx2OpChan[index]:
+	case appliedOp := <-ch:
+		if appliedOp.CId != args.CId || appliedOp.Seq != args.Seq {
+			reply.Err = ErrRetry
+		} else {
+			DPrintf(dInfo, dServer, kv.me, "op %v has been commited in raft, index: %v", appliedOp, index)
+			reply.Err = OK
+			if op.Type == GET {
+				kv.mu.Lock()
+				value, keyExist := kv.db[op.Key]
+				reply.Value = value
+				if !keyExist {
+					reply.Err = ErrNoKey
+				}
+				kv.mu.Unlock()
+			}
+		}
+	case <-time.After(1 * time.Second):
+		DPrintf(dWarn, dServer, kv.me, "commit timeout: op %v", op)
+		reply.Err = ErrRetry
+	}
+
+	kv.mu.Lock()
+	close(kv.idx2OpChan[index])
+	delete(kv.idx2OpChan, index)
+	kv.mu.Unlock()
 }
 
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+func (kv *KVServer) listener() {
+	for msg := range kv.applyCh {
+		if !msg.CommandValid {
+			continue
+		}
+
+		op := msg.Command.(Op)
+
+		kv.mu.Lock()
+		DPrintf(dInfo, dServer, kv.me, "Op [%v] is applied by raft", op)
+		if op.Seq > kv.curMaxSeq[op.CId] {
+			DPrintf(dInfo, dServer, kv.me, "Op [%v] is executed by kv", op)
+			kv.curMaxSeq[op.CId] = op.Seq
+
+			switch op.Type {
+			case PUT:
+				kv.db[op.Key] = op.Value
+			case APPEND:
+				kv.db[op.Key] += op.Value
+			}
+		} else {
+			DPrintf(dInfo, dServer, kv.me, "Op [%v] is not executed by kv, curMaxSeq[%v]: %v", op, op.CId, kv.curMaxSeq[op.CId])
+		}
+
+		if _, ok := kv.idx2OpChan[msg.CommandIndex]; ok {
+			kv.idx2OpChan[msg.CommandIndex] <- op
+		}
+
+		kv.mu.Unlock()
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -86,12 +172,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.db = make(map[string]string)
+	kv.idx2OpChan = make(map[int]chan Op)
+	kv.curMaxSeq = make(map[int]int64)
+
+	go kv.listener()
 
 	return kv
 }

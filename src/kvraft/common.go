@@ -3,10 +3,17 @@ package kvraft
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
+	ErrRetry       = "ErrRetry"
 	ErrWrongLeader = "ErrWrongLeader"
 )
 
 type Err string
+
+const (
+	PUT    string = "Put"
+	GET    string = "Get"
+	APPEND string = "Append"
+)
 
 // Put or Append
 type PutAppendArgs struct {
@@ -29,5 +36,20 @@ type GetArgs struct {
 
 type GetReply struct {
 	Err   Err
+	Value string
+}
+
+type Args struct {
+	CId int
+	Seq int64
+
+	OpType string
+	Key    string
+	Value  string
+}
+
+type Reply struct {
+	Err string
+
 	Value string
 }
