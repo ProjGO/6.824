@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +23,11 @@ type Op struct {
 	Value string
 }
 
+type Snapshot struct {
+	db        map[string]string
+	curMaxSeq map[int]int64
+}
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -35,6 +41,8 @@ type KVServer struct {
 	db         map[string]string
 	idx2OpChan map[int]chan Op
 	curMaxSeq  map[int]int64
+
+	maxIndex int
 }
 
 func (kv *KVServer) Request(args *Args, reply *Reply) {
@@ -102,32 +110,55 @@ func (kv *KVServer) Request(args *Args, reply *Reply) {
 
 func (kv *KVServer) listener() {
 	for msg := range kv.applyCh {
-		if !msg.CommandValid {
-			continue
-		}
-
-		op := msg.Command.(Op)
-
 		kv.mu.Lock()
-		DPrintf(dInfo, dServer, kv.me, "Op [%v] is applied by raft", op)
-		if op.Seq > kv.curMaxSeq[op.CId] {
-			DPrintf(dInfo, dServer, kv.me, "Op [%v] is executed by kv", op)
-			kv.curMaxSeq[op.CId] = op.Seq
+		index := 0
+		if msg.CommandValid {
+			index = msg.CommandIndex
+			op := msg.Command.(Op)
 
-			switch op.Type {
-			case PUT:
-				kv.db[op.Key] = op.Value
-			case APPEND:
-				kv.db[op.Key] += op.Value
+			kv.maxIndex = max(kv.maxIndex, index)
+
+			DPrintf(dInfo, dServer, kv.me, "Op [%v] is applied by raft", op)
+			if op.Seq > kv.curMaxSeq[op.CId] {
+				DPrintf(dInfo, dServer, kv.me, "Op [%v] is executed by kv", op)
+				kv.curMaxSeq[op.CId] = op.Seq
+
+				switch op.Type {
+				case PUT:
+					kv.db[op.Key] = op.Value
+				case APPEND:
+					kv.db[op.Key] += op.Value
+				}
+			} else {
+				DPrintf(dInfo, dServer, kv.me, "Op [%v] is not executed by kv, curMaxSeq[%v]: %v", op, op.CId, kv.curMaxSeq[op.CId])
 			}
-		} else {
-			DPrintf(dInfo, dServer, kv.me, "Op [%v] is not executed by kv, curMaxSeq[%v]: %v", op, op.CId, kv.curMaxSeq[op.CId])
-		}
 
-		if _, ok := kv.idx2OpChan[msg.CommandIndex]; ok {
-			kv.idx2OpChan[msg.CommandIndex] <- op
-		}
+			if _, ok := kv.idx2OpChan[index]; ok {
+				kv.idx2OpChan[index] <- op
+			} else {
+				DPrintf(dError, dServer, kv.me, "kv.idx2OpChan[index(%v)] does not exist", index)
+			}
 
+			if kv.maxraftstate != -1 && index != 0 && kv.rf.StateSize() > 7*kv.maxraftstate {
+				DPrintf(dSnap, dServer, kv.me, "kv.rf.StateSize(%v) > kv.maxraftstate(%v), calling kv.rf.Snapshot()", kv.rf.StateSize(), kv.maxraftstate)
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				e.Encode(kv.db)
+				e.Encode(kv.curMaxSeq)
+				DPrintf(dSnap, dServer, kv.me, "calling rf.Snapshot with index %v", index)
+				kv.rf.Snapshot(index, w.Bytes())
+			}
+		} else if msg.SnapshotValid {
+			if msg.SnapshotIndex >= kv.maxIndex {
+				DPrintf(dSnap, dServer, kv.me, "snapshot received and applied: index: %v, kv.maxIndex: %v", msg.SnapshotIndex, kv.maxIndex)
+				r := bytes.NewBuffer(msg.Snapshot)
+				d := labgob.NewDecoder(r)
+				d.Decode(&kv.db)
+				d.Decode(&kv.curMaxSeq)
+			} else {
+				DPrintf(dSnap, dServer, kv.me, "snapshot received but not applied: index: %v, kv.maxIndex: %v", msg.SnapshotIndex, kv.maxIndex)
+			}
+		}
 		kv.mu.Unlock()
 	}
 }
@@ -144,6 +175,7 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+	DPrintf(dInfo, dServer, kv.me, "is killed")
 }
 
 func (kv *KVServer) killed() bool {
@@ -164,6 +196,8 @@ func (kv *KVServer) killed() bool {
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
+	DPrintf(dInfo, dServer, me, "is starting")
+
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
@@ -180,7 +214,19 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.idx2OpChan = make(map[int]chan Op)
 	kv.curMaxSeq = make(map[int]int64)
 
+	kv.maxIndex = 0
+
+	if kv.rf.StateSize() > 0 {
+		snapshot := kv.rf.GetSnapshot()
+		r := bytes.NewBuffer(snapshot)
+		d := labgob.NewDecoder(r)
+		d.Decode(&kv.db)
+		d.Decode(&kv.curMaxSeq)
+	}
+
 	go kv.listener()
+
+	DPrintf(dInfo, dServer, me, "is starting...done")
 
 	return kv
 }

@@ -1,0 +1,13 @@
+kvraft:
+    TestSnapshotRecoverManyClients3B
+        fail (losing append operation) with low probability (< 1%)
+        decreasing snapshot size threshold seems to increase the fail probability
+        "snapshot size threshold":
+            the lab document requires that raft.StateSize() < 8 * kv.maxraftstate
+            Firstly implemented incorrectly as "kv.rf.StateSize() > kv.maxraftstate"
+                => high fail prob (16 / 1000)
+            fixed to "> 7 * kv.maxraftstate" (8 * kv.maxraftstate will cause StateSize() > 8 * kv.maxraftstate sometimes then fails the test)
+                => lower fail prob (5 / 1000)
+        I'm not sure the real cause of this problem or how to fix it thoroughly
+    TestPersistPartitionUnreliable3A
+        similar problem, losing append, (P < 1 / 1000)

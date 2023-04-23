@@ -107,7 +107,7 @@ cleanup() {
 	for pid in "${waits[@]}"; do
 		kill "$pid"
 		wait "$pid"
-		rm -rf "./manyLog/test-${is[0]}.err" "./manyLog/test-${is[0]}.log"
+		# rm -rf "./manyLog/test-${is[0]}.err" "./manyLog/test-${is[0]}.log"
 		is=("${is[@]:1}")
 	done
 	exit 0

@@ -69,6 +69,7 @@ type Entry struct {
 }
 
 type Log struct {
+	Me   int
 	Data []Entry
 
 	LastIncludedEntry Entry
@@ -91,7 +92,7 @@ func (log *Log) at(idx int) Entry {
 		startIdx := log.Data[0].Index
 		return log.Data[idx-startIdx]
 	} else {
-		DPrintf(dError, -1, "Log.at(%d), log: %v", idx, log)
+		DPrintf(dError, log.Me, "Log.at(%d), log: %v", idx, log)
 		return Entry{}
 	}
 }
@@ -129,7 +130,7 @@ func (log *Log) clear() {
 
 // return a slice of entries with Index starting from (and include) firstIdx
 func (log *Log) getAfter(firstIdx int) []Entry {
-	DPrintf(dInfo, -1, "Log::getAfter firstIdx: %v, log: %v", firstIdx, log)
+	DPrintf(dInfo, log.Me, "Log::getAfter firstIdx: %v, log: %v", firstIdx, log)
 	if firstIdx == log.LastIncludedEntry.Index+1 && len(log.Data) == 0 {
 		return make([]Entry, 0)
 	}
@@ -211,6 +212,9 @@ func (rf *Raft) encodeState() []byte {
 	if rf.mu.TryLock() {
 		defer rf.mu.Unlock()
 	}
+	// for !rf.mu.TryLock() {
+	// }
+	// defer rf.mu.Unlock()
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -257,7 +261,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.VotedFor = votedFor
 		rf.Log = log
 		rf.lastApplied = max(log.LastIncludedEntry.Index, 0)
-		// rf.commitIndex = max(log.LastIncludedEntry.Index, 0)
+		rf.commitIndex = max(log.LastIncludedEntry.Index, 0)
 	}
 }
 
@@ -276,10 +280,16 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 
-	rf.Log.deleteBefore(index)
-	rf.persist()
+	DPrintf(dSnap, rf.me, "making snapshot, log: %v, deleteBefore(%v)", rf.Log, index)
 
+	// Save before deleting log:
+	// RecoverManyClients3B is ok (Pfailure < 1%), but Test2 isn't (high Pfailure (> 80%) & deadlock(?))
+	// rf.persister.Save(rf.encodeState(), snapshot)
+	rf.Log.deleteBefore(index)
+	// Save after deleting log:
+	// RecoverManyClients3B is ok (Pfailure < 1%), 2D is ok too
 	rf.persister.Save(rf.encodeState(), snapshot)
+
 	DPrintf(dSnap, rf.me, "Snapshot: snapshot received and persisted, curFirstIndex = %d, snapshot's last index = %d", curStartIndex, index)
 }
 
@@ -370,13 +380,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.timeLastInhibitionReceived = time.Now()
 
+	DPrintf(dInfo, rf.me, "AppendEntries call received, args: %v", args)
+
+	if args.LeaderId == rf.me {
+		reply.Success = true
+		return
+	}
 	// reply false if term < current.Term
 	if args.Term < rf.CurrentTerm {
 		DPrintf(dInfo, rf.me, "AppendEntries: args.Term %d is smaller than currentTerm %d\n", args.Term, rf.CurrentTerm)
 		return
 	}
-	if args.LeaderId == rf.me {
-		reply.Success = true
+	// when using snapshot, if args.Term == rf.currentTerm, and args.PrevLogIndex < rf.LastIncludedEntry.Index
+	// then the wrong log of this follower can't be recovered by AppendEntries RPC, so we return immediately
+	// let InstallSnapshot RPC fix it (MAYBE NOT RIGHT)
+	// if args.Term <= rf.CurrentTerm && args.PrevLogIndex < rf.Log.LastIncludedEntry.Index {
+	if args.PrevLogIndex < rf.Log.LastIncludedEntry.Index {
+		DPrintf(dInfo, rf.me, "AppendEntries: args.Term %d <= currentTerm %d, and args.PrevLogIndex(%v) < rf.Log.LastIncludedEntry.Index(%v)", args.Term, rf.CurrentTerm, args.PrevLogIndex, rf.Log.LastIncludedEntry.Index)
 		return
 	}
 	if rf.role == CANDIDATE {
@@ -422,6 +442,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// if an existing entry conflicts with a new one (same index but different terms)
 		// delete the existing entry and all that follow it
 		if entry.Index <= rf.Log.last().Index && rf.Log.at(entry.Index).Term != entry.Term {
+			DPrintf(dInfo, rf.me, "AppendEntries: correcting history log, entry.Index(%v) <= rf.log.Last().Index(%v) && rf.Log.at(entry.Index).Term(%v) != entry.Term(%v)", entry.Index, rf.Log.last().Index, rf.Log.at(entry.Index).Term, entry.Term)
 			rf.Log.deleteAfter(entry.Index)
 		}
 		// append new entries not already in the log
@@ -460,13 +481,14 @@ type InstallSnapshotReply struct {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	// defer rf.mu.Unlock()
 
 	DPrintf(dSnap, rf.me, "InstallSnapshot: currentTerm: %v, args: Term: %v, LeaderId: %v, lastTerm: %v, lastIndex: %v", rf.CurrentTerm, args.Term, args.LeaderId, args.LastIncludedTerm, args.LastIncludedIndex)
 
 	reply.Term = rf.CurrentTerm
 
 	if args.Term < rf.CurrentTerm {
+		rf.mu.Unlock()
 		return
 	} else {
 		if args.Term > rf.CurrentTerm {
@@ -479,6 +501,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	if args.LastIncludedIndex <= rf.Log.LastIncludedEntry.Index {
+		rf.mu.Unlock()
 		return
 	}
 
@@ -486,16 +509,33 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.Log.clear()
 		rf.Log.LastIncludedEntry = Entry{Term: args.LastIncludedTerm, Index: args.LastIncludedIndex}
 	} else {
-		rf.Log.deleteAfter(args.LastIncludedIndex)
+		// FIX: when incoming snapshot's index < current log's latest index
+		// we should apply the snapshot and delete the entries with smaller index than shapshot's entry
+		// but SHOULDN'T delete the entries in current log with later index
+		// rf.Log.deleteAfter(args.LastIncludedIndex)
+		rf.Log.deleteBefore(args.LastIncludedIndex)
 	}
 	rf.persister.Save(rf.encodeState(), args.Data)
 
 	// rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
-	rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
+	// rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
+
+	rf.commitIndex = args.LastIncludedIndex
+	rf.lastApplied = args.LastIncludedIndex
+
+	// though sending snapshot to applyCh must be serialized
+	// but we need to release the lock here to prevent deadlock
+	// example(if we still use 'defer mu.unlock() but not unlock manually here):
+	// the following "send to applyCh" is blocked, waiting for client(clerk) to read snapshot from applyCh
+	// and the client called InstallSnapshot, which needs to acquire the lock
+	// but raft can't release the lock unless the InstallSnapshot is returned and the client can read from applyCh
+	// => deadlock
+	rf.mu.Unlock()
 
 	// go func() {
 	// must be serialized, or client (tester) may not see applied snapshot
 	// and thinks the next command applied after this snapshot is out of order
+	DPrintf(dSnap, rf.me, "sending snapshot to applyCh, index: %v", args.LastIncludedIndex)
 	rf.applyCh <- ApplyMsg{
 		CommandValid:  false,
 		SnapshotValid: true,
@@ -749,9 +789,11 @@ func (rf *Raft) appendEntries() {
 
 		toSend := timeCond || numCond
 		if toSend || installSnapshotArgs != nil {
-			DPrintf(dInfo, rf.me, "appending log [%d,%d]", nextIndex, lastLog.Index)
-			appendEntriesArgs.Entries = make([]Entry, lastLog.Index-nextIndex+1)
-			copy(appendEntriesArgs.Entries, rf.Log.getAfter(nextIndex))
+			DPrintf(dInfo, rf.me, "appending log [%d,%d] to server %v", nextIndex, lastLog.Index, i)
+			if numCond {
+				appendEntriesArgs.Entries = make([]Entry, lastLog.Index-nextIndex+1)
+				copy(appendEntriesArgs.Entries, rf.Log.getAfter(nextIndex))
+			}
 
 			rf.timeLastHeartbeatSentToPeer[i] = time.Now()
 			go rf.sendAppendEntries(i, appendEntriesArgs, installSnapshotArgs)
@@ -855,6 +897,7 @@ func (rf *Raft) sendAppendEntries(peerIdx int, appendEntriesArgs *AppendEntriesA
 	}
 
 	for i := rf.commitIndex + 1; i < rf.Log.len(); i++ {
+		DPrintf(dInfo, rf.me, "trying to update commitIndex, i: %v", i)
 		if rf.Log.at(i).Term != rf.CurrentTerm {
 			continue
 		}
@@ -917,6 +960,14 @@ func (rf *Raft) applier() {
 	}
 }
 
+func (rf *Raft) StateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) GetSnapshot() []byte {
+	return rf.persister.snapshot
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -941,6 +992,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = CANDIDATE
 	rf.VotedFor = HAVNTVOTED
 	rf.voteRequested = false
+	rf.Log.Me = me
 	rf.Log.LastIncludedEntry = Entry{Term: -1, Index: -1}
 	rf.timeLastInhibitionReceived = time.Now()
 	rf.timeLastElectionStarted = time.Now()
@@ -972,6 +1024,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	// if persister.SnapshotSize() > 0 {
+	// 	go func() {
+	// 		DPrintf(dSnap, rf.me, "sending initial snapshot to applyCh")
+	// 		applyCh <- ApplyMsg{
+	// 			CommandValid:  false,
+	// 			SnapshotValid: true,
+
+	// 			Snapshot: persister.ReadSnapshot(),
+	// 		}
+	// 	}()
+	// }
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

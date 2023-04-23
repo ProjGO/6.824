@@ -68,9 +68,9 @@ func DPrintf(topic logTopic, role int, hostId int, format string, a ...interface
 		time /= 100
 		prefix := ""
 		if role == dServer {
-			prefix = fmt.Sprintf("%06d CLRK %v Server %d ", time, string(topic), hostId)
+			prefix = fmt.Sprintf("%06d CLRK %v server %v ", time, string(topic), hostId)
 		} else if role == dClient {
-			prefix = fmt.Sprintf("%06d CLRK %v Client %d ", time, string(topic), hostId%10000)
+			prefix = fmt.Sprintf("%06d CLRK %v client %v ", time, string(topic), hostId%10000)
 		}
 		format = prefix + format
 
