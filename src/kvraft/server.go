@@ -52,7 +52,7 @@ func (kv *KVServer) Request(args *Args, reply *Reply) {
 		kv.curMaxSeq[args.CId] = -1
 	}
 	if args.Seq <= kv.curMaxSeq[args.CId] {
-		DPrintf(dInfo, dServer, kv.me, "but args.Seq (%v) <= kv.curMaxSeq[%v] (%v)", args.Seq, args.CId, kv.curMaxSeq[args.CId])
+		DPrintf(dWarn, dServer, kv.me, "but args.Seq (%v) <= kv.curMaxSeq[%v] (%v)", args.Seq, args.CId, kv.curMaxSeq[args.CId])
 		reply.Err = OK
 		reply.Value = kv.db[args.Key]
 		kv.mu.Unlock()
@@ -136,7 +136,9 @@ func (kv *KVServer) listener() {
 			if _, ok := kv.idx2OpChan[index]; ok {
 				kv.idx2OpChan[index] <- op
 			} else {
-				DPrintf(dError, dServer, kv.me, "kv.idx2OpChan[index(%v)] does not exist", index)
+				// current server is the follower, and received "appended entry" from the leader
+				// so there is no corresponding channel of the index
+				// DPrintf(dError, dServer, kv.me, "kv.idx2OpChan[index(%v)] does not exist", index)
 			}
 
 			if kv.maxraftstate != -1 && index != 0 && kv.rf.StateSize() > 7*kv.maxraftstate {

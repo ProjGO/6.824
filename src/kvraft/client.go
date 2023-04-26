@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"math/big"
 	"sync/atomic"
+	"time"
 
 	"6.5840/labrpc"
 )
@@ -65,25 +66,21 @@ func (ck *Clerk) Request(key string, value string, op string) string {
 			DPrintf(dError, dClient, ck.me, "*****%v %v", ok, reply.Err)
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
-	if op == GET {
-		DPrintf(dInfo, dClient, ck.me, "Request Get done: key: %v, value: %v", key, reply.Value)
-	} else {
-		DPrintf(dInfo, dClient, ck.me, "Request %v done: key: %v, value: %v", op, key, value)
-	}
+	DPrintf(dInfo, dClient, ck.me, "Request %v done: key: %v, value: %v", op, key, value)
 
 	return reply.Value
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	// ck.PutAppend(key, value, "Put")
-	ck.Request(key, value, "Put")
+	ck.Request(key, value, PUT)
 
 }
 func (ck *Clerk) Append(key string, value string) {
-	// ck.PutAppend(key, value, "Append")
-	ck.Request(key, value, "Append")
+	ck.Request(key, value, APPEND)
 }
 func (ck *Clerk) Get(key string) string {
-	return ck.Request(key, "", "Get")
+	return ck.Request(key, "", GET)
 }
