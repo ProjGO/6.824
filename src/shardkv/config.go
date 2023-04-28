@@ -1,21 +1,25 @@
 package shardkv
 
-import "6.5840/shardctrler"
-import "6.5840/labrpc"
-import "testing"
-import "os"
+import (
+	"os"
+	"testing"
 
-// import "log"
-import crand "crypto/rand"
-import "math/big"
-import "math/rand"
-import "encoding/base64"
-import "sync"
-import "runtime"
-import "6.5840/raft"
-import "strconv"
-import "fmt"
-import "time"
+	"6.5840/labrpc"
+	"6.5840/shardctrler"
+
+	// import "log"
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"math/big"
+	"math/rand"
+	"runtime"
+	"strconv"
+	"sync"
+	"time"
+
+	"6.5840/raft"
+)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -316,6 +320,7 @@ func (cfg *config) joinm(gis []int) {
 			servernames[i] = cfg.servername(gid, i)
 		}
 		m[gid] = servernames
+		TPrintf("group %v has joined", gid)
 	}
 	cfg.mck.Join(m)
 }
@@ -331,10 +336,13 @@ func (cfg *config) leavem(gis []int) {
 		gids = append(gids, cfg.groups[g].gid)
 	}
 	cfg.mck.Leave(gids)
+	TPrintf("group %v has left", gids)
 }
 
 var ncpu_once sync.Once
 
+// n: num of servers in each group
+// there will always be 3 groups (?)
 func make_config(t *testing.T, n int, unreliable bool, maxraftstate int) *config {
 	ncpu_once.Do(func() {
 		if runtime.NumCPU() < 2 {

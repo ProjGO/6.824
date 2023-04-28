@@ -1,5 +1,7 @@
 package shardkv
 
+import "6.5840/shardctrler"
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running Raft.
@@ -14,31 +16,56 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrRetry       = "ErrRetry"
+
+	ErrOlderConfig = "ErrOlderConfig"
 )
 
 type Err string
 
-// Put or Append
-type PutAppendArgs struct {
-	// You'll have to add definitions here.
-	Key   string
-	Value string
-	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+const (
+	PUT    string = "Put"
+	GET    string = "Get"
+	APPEND string = "Append"
+)
+
+type KvArgs struct {
+	CId int
+	Seq int64
+
+	OpType string
+	Key    string
+	Value  string
 }
 
-type PutAppendReply struct {
+type KvReply struct {
 	Err Err
-}
 
-type GetArgs struct {
-	Key string
-	// You'll have to add definitions here.
-}
-
-type GetReply struct {
-	Err   Err
 	Value string
+}
+
+// which shard is a key in?
+// please use this function,
+// and please do not change it.
+func key2shard(key string) int {
+	shard := 0
+	if len(key) > 0 {
+		shard = int(key[0])
+	}
+	shard %= shardctrler.NShards
+	return shard
+}
+
+type MigrateArgs struct {
+	Shard     int
+	ConfigNum int
+}
+
+type MigrateReply struct {
+	Shard     int
+	ConfigNum int
+
+	Err        Err
+	DB         map[string]string
+	CId2MaxSeq map[int]int64
 }
