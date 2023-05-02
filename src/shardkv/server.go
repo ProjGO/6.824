@@ -16,8 +16,11 @@ import (
 type ShardStatus string
 
 const (
-	READY      ShardStatus = "READY"
-	TOPULL     ShardStatus = "TOPULL"
+	// the shard is assigned to this server, and this server has pulled the latest date of this shard
+	READY ShardStatus = "READY"
+	// the shard is assigned to this server, but the data of the shard needs to be pulled before serving for this shard
+	TOPULL ShardStatus = "TOPULL"
+	// the shard is going to be pulled by other server, NOT IN USE NOW
 	TOBEPULLED ShardStatus = "TOBEPULLED"
 )
 
@@ -46,10 +49,10 @@ type ShardKV struct {
 	// Your definitions here.
 	dead int32
 
-	sc         *shardctrler.Clerk
-	db         map[string]string
-	idx2OpChan map[int]chan Op
-	cid2MaxSeq map[int]int64
+	sc                 *shardctrler.Clerk
+	db                 map[string]string
+	idx2OpChan         map[int]chan Op
+	cid2MaxSeqAndReply map[int]SeqAndReply
 
 	maxCommandIndex int
 
@@ -60,28 +63,39 @@ type ShardKV struct {
 	shardsToBePulled map[int]map[int]map[string]string
 	// shard -> configNum
 	// to update the config to kv.config, which shards need to be pulled and which configNum shoud be used when calling ShardMigration
-	// CHECK: why we need to store "configNum" of each shard and put in request of calling ShardMigration
+	// +CHECK: why we need to store "configNum" of each shard and put it in request of calling ShardMigration
+	// +ANS: to help the lagged server to catch up the current config
+	//      the config need to be applied ONE BY ONE
+	//      so every history "diff" should be stored
 	shardsToPull2ConfigNum map[int]int
 	// which shard does this server can serve now
-	// "can serve": the shard is assigned to this server, and this server has pulled the latest date of this shard
+	// the shards that are not assigned to this server in the current config SHOULD NOT appear in the map
 	shardsStatus map[int]ShardStatus
 }
 
 func (kv *ShardKV) Request(args *KvArgs, reply *KvReply) {
 	DPrintf(dInfo, dServer, kv, "received new request: %+v", args)
 	kv.mu.Lock()
-	if _, ok := kv.cid2MaxSeq[args.CId]; !ok {
-		kv.cid2MaxSeq[args.CId] = 0
+	if _, ok := kv.cid2MaxSeqAndReply[args.CId]; !ok {
+		kv.cid2MaxSeqAndReply[args.CId] = SeqAndReply{
+			Seq: 0,
+
+			Type:  args.OpType,
+			Value: "",
+		}
 	}
-	if args.Seq <= kv.cid2MaxSeq[args.CId] {
-		DPrintf(dWarn, dServer, kv, "but args.Seq (%v) <= kv.curMaxSeq[%v] (%v)", args.Seq, args.CId, kv.cid2MaxSeq[args.CId])
+	if args.Seq <= kv.cid2MaxSeqAndReply[args.CId].Seq {
+		DPrintf(dWarn, dServer, kv, "but args.Seq (%v) <= kv.curMaxSeq[%v] (%v)", args.Seq, args.CId, kv.cid2MaxSeqAndReply[args.CId].Seq)
 		reply.Err = OK
-		reply.Value = kv.db[args.Key]
+		// -CHECK: why using kv.db[args.Key] is wrong?
+		// (TestUnreliable3)
+		// reply.Value = kv.db[args.Key]
+		reply.Value = kv.cid2MaxSeqAndReply[args.CId].Value
 		kv.mu.Unlock()
 		return
 	}
 	if shardStatus, ok := kv.shardsStatus[key2shard(args.Key)]; shardStatus != READY || !ok {
-		DPrintf(dWarn, dServer, kv, "but shard (%v) of key (%v) doesn't match this group(%v)'s shards (%v)", key2shard(args.Key), args.Key, kv.gid, kv.shardsStatus)
+		DPrintf(dWarn, dServer, kv, "Request: but I'm not in charge of shard %v (key: %v) now, my shards: %+v", key2shard(args.Key), args.Key, kv.shardsStatus)
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		return
@@ -110,9 +124,9 @@ func (kv *ShardKV) Request(args *KvArgs, reply *KvReply) {
 	select {
 	case appliedOp := <-ch:
 		if appliedOp.CId != args.CId || appliedOp.Seq != args.Seq {
-			// CHECK: in what circumstance this will happen?
-			// the original Op is not actually commited by raft
-			// instead another Op commited by another raft server with the same index is sent to applyCh
+			// +CHECK: in what circumstance this will happen?
+			// +ANS: the original Op is not actually commited by raft
+			//       instead another Op commited by another raft server with the same index is sent to applyCh
 			reply.Err = ErrRetry
 		} else if appliedOp.Type == ErrWrongGroup {
 			reply.Err = ErrWrongGroup
@@ -137,6 +151,7 @@ func (kv *ShardKV) Request(args *KvArgs, reply *KvReply) {
 				//     but actually the "GET" op is commited by raft, so the value at that moment (which is not modified by any other process) should be returned
 				// so we use the value read in listener
 				reply.Value = appliedOp.Value
+				DPrintf(dInfo, dServer, kv, "Request: GET %v = %v", op.Key, appliedOp.Value)
 			}
 		}
 	case <-time.After(1 * time.Second):
@@ -181,14 +196,15 @@ func (kv *ShardKV) ShardMigration(args *MigrateArgs, reply *MigrateReply) {
 	}
 
 	reply.DB = make(map[string]string)
-	reply.CId2MaxSeq = make(map[int]int64)
+	// reply.CId2MaxSeq = make(map[int]int64)
+	reply.CId2MaxSeqAndReply = make(map[int]SeqAndReply)
 	for k, v := range kv.shardsToBePulled[args.ConfigNum][args.Shard] {
 		reply.DB[k] = v
 	}
 	// TODO: what if the current kv.cid2MaxSeq doesn't match the "toOutShards" of an old config?
 	// (all toOutShards is stored in kv.toOutShards indexed by configNum)
-	for cid, maxSeq := range kv.cid2MaxSeq {
-		reply.CId2MaxSeq[cid] = maxSeq
+	for cid, maxSeqAndReply := range kv.cid2MaxSeqAndReply {
+		reply.CId2MaxSeqAndReply[cid] = maxSeqAndReply
 	}
 
 	DPrintf(dInfo, dServer, kv, "ShardMigration done, reply: %+v", reply)
@@ -262,7 +278,7 @@ func (kv *ShardKV) applyConfig(config shardctrler.Config) {
 		for k, v := range kv.db {
 			if key2shard(k) == shard {
 				outDb[k] = v
-				delete(kv.db, k)
+				// delete(kv.db, k)
 			}
 		}
 		kv.shardsToBePulled[oldConfig.Num][shard] = outDb
@@ -283,14 +299,17 @@ func (kv *ShardKV) applyMigratedShard(reply MigrateReply) {
 		for k, v := range reply.DB {
 			kv.db[k] = v
 		}
-		for k, v := range reply.CId2MaxSeq {
-			// kv.cid2MaxSeq[k] = v
-			// HINT:
-			kv.cid2MaxSeq[k] = max64(kv.cid2MaxSeq[k], v)
+		for k, v := range reply.CId2MaxSeqAndReply {
+			// -CHECK (TestConcurrent1/3)
+			// why we need to judge which one is larger before update?
+			if v.Seq > kv.cid2MaxSeqAndReply[k].Seq {
+				kv.cid2MaxSeqAndReply[k] = v
+			}
+			// kv.cid2MaxSeqAndReply[k] = v
 		}
 		kv.shardsStatus[reply.Shard] = READY
 	} else {
-		DPrintf(dWarn, dServer, kv, "but I'm not in charge of shard %v, my shards: %+v", reply.Shard, kv.shardsStatus)
+		DPrintf(dWarn, dServer, kv, "applyMigratedShard: but I'm not in charge of shard %v, my shards: %+v", reply.Shard, kv.shardsStatus)
 	}
 }
 
@@ -298,7 +317,8 @@ func (kv *ShardKV) makeSnapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.db)
-	e.Encode(kv.cid2MaxSeq)
+	// e.Encode(kv.cid2MaxSeq)
+	e.Encode(kv.cid2MaxSeqAndReply)
 	e.Encode(kv.config)
 	e.Encode(kv.shardsToBePulled)
 	e.Encode(kv.shardsToPull2ConfigNum)
@@ -310,26 +330,61 @@ func (kv *ShardKV) makeSnapshot() []byte {
 func (kv *ShardKV) applySnapshot(snapshot []byte) {
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
-	d.Decode(&kv.db)
-	d.Decode(&kv.cid2MaxSeq)
-	d.Decode(&kv.config)
-	d.Decode(&kv.shardsToBePulled)
-	d.Decode(&kv.shardsToPull2ConfigNum)
-	d.Decode(&kv.shardsStatus)
+
+	// CHECK (TestUnreliable3)
+	// it seems that you can't use "d.Decode(&k.xxx)" directly or some fields of the snapshot will be corrupted, but why, or is this true?
+	var db map[string]string
+	var cid2MaxSeqAndReply map[int]SeqAndReply
+	var config shardctrler.Config
+	var shardsToBePulled map[int]map[int]map[string]string
+	var shardsToPull2ConfigNum map[int]int
+	var shardsStatus map[int]ShardStatus
+
+	// TODO
+	// find out a neater implementation
+	if err := d.Decode(&db); err != nil {
+		DPrintf(dError, dServer, kv, "applySnapshot: failed to decode db, error: %v", err)
+	}
+	if err := d.Decode(&cid2MaxSeqAndReply); err != nil {
+		DPrintf(dError, dServer, kv, "applySnapshot: failed to decode cid2MaxSeq, error: %v", err)
+	}
+	if err := d.Decode(&config); err != nil {
+		DPrintf(dError, dServer, kv, "applySnapshot: failed to decode config, error: %v", err)
+	}
+	if err := d.Decode(&shardsToBePulled); err != nil {
+		DPrintf(dError, dServer, kv, "applySnapshot: failed to decode shardsToBePulled, error: %v", err)
+	}
+	if err := d.Decode(&shardsToPull2ConfigNum); err != nil {
+		DPrintf(dError, dServer, kv, "applySnapshot: failed to decode shardsToPull2ConfigNum, error: %v", err)
+	}
+	if err := d.Decode(&shardsStatus); err != nil {
+		DPrintf(dError, dServer, kv, "applySnapshot: failed to decode shardsStatus, error: %v", err)
+	}
+
+	if config.Num > kv.config.Num {
+		DPrintf(dWarn, dServer, kv, "update to new config via a Snapshot: new config: %+v, new shardsStatus: %+v", config, shardsStatus)
+	}
+
+	kv.db = db
+	kv.cid2MaxSeqAndReply = cid2MaxSeqAndReply
+	kv.config = config
+	kv.shardsToBePulled = shardsToBePulled
+	kv.shardsToPull2ConfigNum = shardsToPull2ConfigNum
+	kv.shardsStatus = shardsStatus
 }
 
 func (kv *ShardKV) listener() {
 	for msg := range kv.applyCh {
 		kv.mu.Lock()
-		// CHECK: why this is possible ???
-		// if commandIndex <= kv.maxCommandIndex {
-		// 	DPrintf(dError, dServer, kv, "!!! found duplicate msg.index: %v, msg: %+v", commandIndex, msg)
-		// 	// seems that even there is duplicate index from raft
-		// 	// we still need to execute these command? (or there will be lost Op, complained by "op.Seq > maxSeq + 1")
+		// HINT
+		// the old if-else is ABSOLUTELY WRONG
+		// (see older git commit for more detail
+		// judge the type of Command by xx, ok = msg.Command.(Type), especially to judge Snapshot
+		// as in the current implementation, the Snapshot and Command are two seperated type of message, and use seperated field (Command and Snapshot)
+		// and Ops to KV, Config, MigrateReply are all "Command"
+		// so use "_, ok = msg.command.([]byte); ok" will always return false
+		// the snapshots will never be applied by shardkv which is the root cause of previous "missing raft op" error
 
-		// 	// kv.mu.Unlock()
-		// 	// continue
-		// }
 		// if op, ok := msg.Command.(Op); ok {
 		if msg.CommandValid {
 			commandIndex := msg.CommandIndex
@@ -344,21 +399,25 @@ func (kv *ShardKV) listener() {
 					// double check whether the shard still belongs to this group after raft has commited the Op
 					// borrow the "Type" field to indicate that the shard no longer belongs to current group
 					op.Type = ErrWrongGroup
-					DPrintf(dWarn, dServer, kv, "but I'm not in charge of shard %v now, my shards: %+v", shard, kv.shardsStatus)
+					DPrintf(dWarn, dServer, kv, "listener: but I'm not in charge of shard %v (key: %v) now, my shards: %+v", shard, op.Key, kv.shardsStatus)
 				} else {
-					maxSeq, found := kv.cid2MaxSeq[op.CId]
+					maxSeqAndReply, found := kv.cid2MaxSeqAndReply[op.CId]
+					maxSeq := maxSeqAndReply.Seq
 					if !found || op.Seq > maxSeq {
-						if op.Seq > maxSeq {
-							if op.Seq == maxSeq+1 {
-								DPrintf(dInfo, dServer, kv, "Op [%v] is executed by kv because op.Seq (%v) > kv.cid2MaxSeq[%v] (%v)", op, op.Seq, op.CId, maxSeq)
+						if op.Seq > maxSeqAndReply.Seq {
+							if op.Seq == maxSeqAndReply.Seq+1 {
+								DPrintf(dInfo, dServer, kv, "Op [%v] is executed by kv because op.Seq (%v) > kv.cid2MaxSeqAndReply[%v].Seq (%v)", op, op.Seq, op.CId, maxSeq)
 							} else {
-								DPrintf(dError, dServer, kv, "!!! Op [%v] .seq (%v) != kv.cid2MaxSeq[%v] (%v) + 1, Op may be lost", op, op.Seq, op.CId, maxSeq)
+								DPrintf(dError, dServer, kv, "!!! Op [%v] .seq (%v) != kv.cid2MaxSeqAndReply[%v].Seq (%v) + 1, Op may be lost", op, op.Seq, op.CId, maxSeq)
 							}
 						} else {
-							DPrintf(dInfo, dServer, kv, "Op [%v] is executed by kv because op.CId (%v) is not found in kv.cid2MaxSeq (%v)", op, op.CId, kv.cid2MaxSeq)
+							DPrintf(dInfo, dServer, kv, "Op [%v] is executed by kv because op.CId (%v) is not found in kv.cid2MaxSeq (%v)", op, op.CId, kv.cid2MaxSeqAndReply)
 						}
 
-						kv.cid2MaxSeq[op.CId] = op.Seq
+						newMaxSeqAndReply := SeqAndReply{
+							Seq:  op.Seq,
+							Type: op.Type,
+						}
 						switch op.Type {
 						case PUT:
 							kv.db[op.Key] = op.Value
@@ -369,9 +428,29 @@ func (kv *ShardKV) listener() {
 							// get the latest value, as kv.db may be updated by MigrateReply
 							// again, borrow the "Value" failed
 							op.Value = kv.db[op.Key]
+							newMaxSeqAndReply.Value = op.Value
+							DPrintf(dInfo, dServer, kv, "listener: GET (%v): %v", op.Key, op.Value)
 						}
+						kv.cid2MaxSeqAndReply[op.CId] = newMaxSeqAndReply
 					} else {
-						DPrintf(dInfo, dServer, kv, "Op [%v] is not executed by kv, curMaxSeq[%v]: %v", op, op.CId, kv.cid2MaxSeq[op.CId])
+						if op.Type == GET {
+							if maxSeq == op.Seq {
+								// -CHECK (TestUnreliable3)
+								// it seems that both maxSeqAndReply.Value and kv.db[op.Key] are ok here
+								// but in "Request()", only maxSeqAndReply.Value is ok
+								op.Value = maxSeqAndReply.Value
+								// op.Value = kv.db[op.Key]
+								DPrintf(dWarn, dServer, kv, "Op [%v] is duplicate GET, replied last Get value: curMaxSeqAndReply[%+v]: %v", op, op.CId, kv.cid2MaxSeqAndReply[op.CId])
+							} else {
+								// -CHECK
+								// what if maxSeq < op.Seq
+								DPrintf(dError, dServer, kv, "Op [%v] is duplicate GET, replied last Geted value: curMaxSeqAndReply[%+v]: %v", op, op.CId, kv.cid2MaxSeqAndReply[op.CId])
+							}
+						} else {
+							// -CHECK, HINT
+							// so the duplicate PUT or APPEND should be just ignored?
+							DPrintf(dWarn, dServer, kv, "Op [%v] is not executed by kv, curMaxSeqAndReply[%v]: %v", op, op.CId, kv.cid2MaxSeqAndReply[op.CId])
+						}
 					}
 				}
 
@@ -417,7 +496,10 @@ func (kv *ShardKV) updateConfig() {
 		kv.mu.Unlock()
 		return
 	}
-	// to prevent race
+	// HINT
+	// use the copy of kv.config.Num to prevent race
+	// CHECK
+	// is this really necessary?
 	targetConfigNum := kv.config.Num + 1
 	kv.mu.Unlock()
 	// newConfig := kv.sc.Query(-1)
@@ -547,7 +629,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.db = make(map[string]string)
 	kv.idx2OpChan = make(map[int]chan Op)
-	kv.cid2MaxSeq = make(map[int]int64)
+	// kv.cid2MaxSeq = make(map[int]int64)
+	kv.cid2MaxSeqAndReply = make(map[int]SeqAndReply)
 
 	kv.shardsToBePulled = make(map[int]map[int]map[string]string)
 	kv.shardsToPull2ConfigNum = make(map[int]int)
@@ -556,7 +639,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.maxCommandIndex = 0
 
-	if kv.rf.StateSize() > 0 {
+	// ***
+	// use "SnapshotSize()()"""" instead of "RaftStateSize" !!!
+	if persister.SnapshotSize() > 0 {
 		snapshot := kv.rf.GetSnapshot()
 		kv.applySnapshot(snapshot)
 	}

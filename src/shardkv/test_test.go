@@ -463,6 +463,8 @@ func TestConcurrent3(t *testing.T) {
 	cfg.join(0)
 
 	n := 10
+	// n := 2
+	// n := 1
 	ka := make([]string, n)
 	va := make([]string, n)
 	for i := 0; i < n; i++ {
@@ -480,6 +482,7 @@ func TestConcurrent3(t *testing.T) {
 			x := randstring(1)
 			ck1.Append(ka[i], x)
 			va[i] += x
+			TPrintf("va[%v]: %v", i, va[i])
 		}
 	}
 
@@ -493,14 +496,17 @@ func TestConcurrent3(t *testing.T) {
 		cfg.join(2)
 		cfg.join(1)
 		time.Sleep(time.Duration(rand.Int()%900) * time.Millisecond)
+		// time.Sleep(time.Duration(2000) * time.Millisecond)
+
 		cfg.ShutdownGroup(0)
 		cfg.ShutdownGroup(1)
 		cfg.ShutdownGroup(2)
 		cfg.StartGroup(0)
 		cfg.StartGroup(1)
 		cfg.StartGroup(2)
-
 		time.Sleep(time.Duration(rand.Int()%900) * time.Millisecond)
+		// time.Sleep(time.Duration(2000) * time.Millisecond)
+
 		cfg.leave(1)
 		cfg.leave(2)
 		time.Sleep(time.Duration(rand.Int()%900) * time.Millisecond)

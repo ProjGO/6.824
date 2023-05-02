@@ -70,15 +70,40 @@ func (ck *Clerk) Request(key string, value string, op string) string {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := ck.leaderId; si < len(servers); si = (si + 1) % len(servers) {
+			// HINT: see the following HINT
+			// for si := ck.leaderId; si < len(servers); si = (si + 1) % len(servers) {
+			for i := 0; i < len(servers); i = i + 1 {
+				si := (ck.leaderId + i) % len(servers)
+				DPrintf(dInfo, dClient, nil, "sending Request: %v %v %v to %v:%v", op, key, value, gid, si)
 				srv := ck.make_end(servers[si])
 				var reply KvReply
 				ok := srv.Call("ShardKV.Request", &args, &reply)
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+				// if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+				if ok && reply.Err == OK {
+					DPrintf(dInfo, dClient, nil, "Request: %v %v %v: OK, reply.Value: %v", op, key, value, reply.Value)
 					return reply.Value
 				}
 				if ok && reply.Err == ErrWrongGroup {
-					break
+					DPrintf(dWarn, dClient, nil, "Request: %v %v %v: ErrWrongGroup (%v)", op, key, value, gid)
+					// HINT
+					// YOU SHOULD NOT BREAK HERE
+					// ErrWrongGroup may be caused by a lagging server in the right group
+					// eg: 3 server in the group that is responsible of the key's shard in the latest config:
+					// server 0 and 2 is updated to the latest config, server 1 is not up to date due to network failure and server 2 is the leader
+					// the current ck.leaderId = 0, so it tries server 0 first, but server 0 replied ErrWrongLeader
+					// then it tries server 1, server 1 is not up to date, and the shard is not assigned to yet it in the old config, so it returns ErrWrongGroup
+					// Now WE SHOULD TRY SERVER 2 instead of just break the loop and start a new turn of polling
+					// OR IT WILL TRY BETWEEN SERVER0 AND SERVER 0 INDEFINITELY
+					// break
+
+					// (the above comment is corresponding to the following loop condition:
+					// for si := ck.leaderId; si < len(servers); si = (si + 1) % len(servers)
+					// which will loop indefinitely unless you break it or return
+					// so the "break" is necessary when using this loop condition
+					// as you need to jump out of the loop if you are really using a wrong group (and the servers in the group are all up to date)
+					// so the real problem is at the loop condition, the right way is:
+					// 		ask for every server in the group in turn even when some of them returns a non-OK reply
+					// 		once after every server is tried at once, exit the loop and try to update the config
 				}
 				// ... not ok, or ErrWrongLeader
 			}
@@ -86,6 +111,7 @@ func (ck *Clerk) Request(key string, value string, op string) string {
 		time.Sleep(100 * time.Millisecond)
 		// ask controler for the latest configuration.
 		ck.config = ck.sc.Query(-1)
+		DPrintf(dInfo, dClient, nil, "config is updated: %+v", ck.config)
 	}
 }
 

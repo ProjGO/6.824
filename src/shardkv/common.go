@@ -56,6 +56,13 @@ func key2shard(key string) int {
 	return shard
 }
 
+type SeqAndReply struct {
+	Seq int64
+
+	Type  string
+	Value string
+}
+
 type MigrateArgs struct {
 	Shard     int
 	ConfigNum int
@@ -65,7 +72,8 @@ type MigrateReply struct {
 	Shard     int
 	ConfigNum int
 
-	Err        Err
-	DB         map[string]string
-	CId2MaxSeq map[int]int64
+	Err Err
+	DB  map[string]string
+	// CId2MaxSeq map[int]int64
+	CId2MaxSeqAndReply map[int]SeqAndReply
 }
