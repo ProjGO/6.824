@@ -12,6 +12,15 @@ import (
 	"6.5840/shardctrler"
 )
 
+// use string for log's readability
+type ShardStatus string
+
+const (
+	READY      ShardStatus = "READY"
+	TOPULL     ShardStatus = "TOPULL"
+	TOBEPULLED ShardStatus = "TOBEPULLED"
+)
+
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
@@ -55,8 +64,7 @@ type ShardKV struct {
 	shardsToPull2ConfigNum map[int]int
 	// which shard does this server can serve now
 	// "can serve": the shard is assigned to this server, and this server has pulled the latest date of this shard
-	// TODO: record the state of each shard more explicitly
-	hasShard map[int]bool
+	shardsStatus map[int]ShardStatus
 }
 
 func (kv *ShardKV) Request(args *KvArgs, reply *KvReply) {
@@ -72,10 +80,8 @@ func (kv *ShardKV) Request(args *KvArgs, reply *KvReply) {
 		kv.mu.Unlock()
 		return
 	}
-	// if ok := kv.config.Shards[key2shard(args.Key)] == kv.gid; !ok {
-	// if !kv.hasShard[key2shard(args.Key)] {
-	if shardIsOk, hasShard := kv.hasShard[key2shard(args.Key)]; !shardIsOk || !hasShard {
-		DPrintf(dWarn, dServer, kv, "but shard (%v) of key (%v) doesn't match this group(%v)'s shards (%v)", key2shard(args.Key), args.Key, kv.gid, kv.hasShard)
+	if shardStatus, ok := kv.shardsStatus[key2shard(args.Key)]; shardStatus != READY || !ok {
+		DPrintf(dWarn, dServer, kv, "but shard (%v) of key (%v) doesn't match this group(%v)'s shards (%v)", key2shard(args.Key), args.Key, kv.gid, kv.shardsStatus)
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		return
@@ -188,7 +194,7 @@ func (kv *ShardKV) ShardMigration(args *MigrateArgs, reply *MigrateReply) {
 	DPrintf(dInfo, dServer, kv, "ShardMigration done, reply: %+v", reply)
 }
 
-func (kv *ShardKV) updateInAndOutShard(config shardctrler.Config) {
+func (kv *ShardKV) applyConfig(config shardctrler.Config) {
 	if config.Num <= kv.config.Num {
 		return
 	}
@@ -197,8 +203,12 @@ func (kv *ShardKV) updateInAndOutShard(config shardctrler.Config) {
 	oldConfig := kv.config
 	// initial as: "all shards are no more needed"
 	shardsToBePulled := make(map[int]bool)
-	for k := range kv.hasShard {
-		shardsToBePulled[k] = true
+	for shard, shardStatus := range kv.shardsStatus {
+		if shardStatus == READY {
+			shardsToBePulled[shard] = true
+		} else {
+			DPrintf(dError, dServer, kv, "applyConfig: shardsStatus[%v] is %v but not READY before applying new config", shard, shardStatus)
+		}
 	}
 	kv.config = config
 
@@ -207,14 +217,12 @@ func (kv *ShardKV) updateInAndOutShard(config shardctrler.Config) {
 		if gid == kv.gid {
 			// if oldConfig.Num == 0, there is no need to pull any shard from group 0 (it doesn't exist.)
 			if oldConfig.Num == 0 {
-				// well, only from config 0 to config 1 (initial config) doesn't need any actual pull operation, and the shards can be seen as "READY"
-				// TODO: find a more elegent initialize method
-				kv.hasShard[shard] = true
-				// the following "if" should be possible, as config should be taken ONE BY ONE
-				if config.Num > 1 {
-					kv.hasShard[shard] = false
-					kv.shardsToPull2ConfigNum[shard] = config.Num - 1
-				}
+				kv.shardsStatus[shard] = READY
+				// the following "if" should be impossible, as config should be taken ONE BY ONE
+				// if config.Num > 1 {
+				// 	kv.hasShard[shard] = false
+				// 	kv.shardsToPull2ConfigNum[shard] = config.Num - 1
+				// }
 			} else {
 				// if this group doesn't have the shard in last config, then mark it as "to be pulled"
 				// "to be pulled": kv.hasShard has key "shard", but the value is false
@@ -226,9 +234,14 @@ func (kv *ShardKV) updateInAndOutShard(config shardctrler.Config) {
 				// at this point (a new config is taken), all value in kv.hasShard should be true (the data of all assigned shard should be up-to-date in last config)
 				// so the "!hasShard" should never be true
 				// if hasShard, ok := kv.hasShard[shard]; !ok || !hasShard {
-				if _, ok := kv.hasShard[shard]; !ok {
+				// if _, ok := kv.hasShard[shard]; !ok {
+				// 	kv.shardsToPull2ConfigNum[shard] = oldConfig.Num
+				// 	kv.hasShard[shard] = false
+				// }
+
+				if _, ok := kv.shardsStatus[shard]; !ok {
 					kv.shardsToPull2ConfigNum[shard] = oldConfig.Num
-					kv.hasShard[shard] = false
+					kv.shardsStatus[shard] = TOPULL
 				}
 
 				// ok, this group is still in charge of the shard in the new config
@@ -237,7 +250,8 @@ func (kv *ShardKV) updateInAndOutShard(config shardctrler.Config) {
 			}
 		} else {
 			// kv.hasShard[shard] = false
-			delete(kv.hasShard, shard)
+			// delete(kv.hasShard, shard)
+			delete(kv.shardsStatus, shard)
 		}
 	}
 
@@ -252,7 +266,6 @@ func (kv *ShardKV) updateInAndOutShard(config shardctrler.Config) {
 			}
 		}
 		kv.shardsToBePulled[oldConfig.Num][shard] = outDb
-		// kv.toBePulledShards[config.Num][shard] = outDb
 	}
 }
 
@@ -264,10 +277,9 @@ func (kv *ShardKV) applyMigratedShard(reply MigrateReply) {
 
 	delete(kv.shardsToPull2ConfigNum, reply.Shard)
 	// HINT
-	// alreadyUpdated?
+	// applyMigratedShard only when shardStatus == TOPULL?
 	// 	to prevent duplicate MigrateReply, which may overwrite the updated value between this reply and last (first) MigrateReply of the same shard
-	if alreadyUpdated, ok := kv.hasShard[reply.Shard]; ok && !alreadyUpdated {
-		kv.hasShard[reply.Shard] = true
+	if shardStatus, ok := kv.shardsStatus[reply.Shard]; ok && shardStatus == TOPULL {
 		for k, v := range reply.DB {
 			kv.db[k] = v
 		}
@@ -276,8 +288,9 @@ func (kv *ShardKV) applyMigratedShard(reply MigrateReply) {
 			// HINT:
 			kv.cid2MaxSeq[k] = max64(kv.cid2MaxSeq[k], v)
 		}
+		kv.shardsStatus[reply.Shard] = READY
 	} else {
-		DPrintf(dWarn, dServer, kv, "but I'm not in charge of shard %v, my shards: %+v", reply.Shard, kv.hasShard)
+		DPrintf(dWarn, dServer, kv, "but I'm not in charge of shard %v, my shards: %+v", reply.Shard, kv.shardsStatus)
 	}
 }
 
@@ -289,7 +302,7 @@ func (kv *ShardKV) makeSnapshot() []byte {
 	e.Encode(kv.config)
 	e.Encode(kv.shardsToBePulled)
 	e.Encode(kv.shardsToPull2ConfigNum)
-	e.Encode(kv.hasShard)
+	e.Encode(kv.shardsStatus)
 
 	return w.Bytes()
 }
@@ -302,7 +315,7 @@ func (kv *ShardKV) applySnapshot(snapshot []byte) {
 	d.Decode(&kv.config)
 	d.Decode(&kv.shardsToBePulled)
 	d.Decode(&kv.shardsToPull2ConfigNum)
-	d.Decode(&kv.hasShard)
+	d.Decode(&kv.shardsStatus)
 }
 
 func (kv *ShardKV) listener() {
@@ -317,68 +330,71 @@ func (kv *ShardKV) listener() {
 		// 	// kv.mu.Unlock()
 		// 	// continue
 		// }
-		if op, ok := msg.Command.(Op); ok {
+		// if op, ok := msg.Command.(Op); ok {
+		if msg.CommandValid {
 			commandIndex := msg.CommandIndex
-			kv.maxCommandIndex = max(kv.maxCommandIndex, commandIndex)
-			DPrintf(dInfo, dServer, kv, "Op [%v] is commited by raft, index: %v, kv.maxIndex: %v", op, commandIndex, kv.maxCommandIndex)
+			if op, ok := msg.Command.(Op); ok {
+				kv.maxCommandIndex = max(kv.maxCommandIndex, commandIndex)
+				DPrintf(dInfo, dServer, kv, "Op [%v] is commited by raft, index: %v, kv.maxIndex: %v", op, commandIndex, kv.maxCommandIndex)
 
-			shard := key2shard(op.Key)
-			// shardIsOk, hasShard := kv.hasShard[shard]
-			// if !shardIsOk || !hasShard {
-			if shardIsOk, hasShard := kv.hasShard[shard]; !hasShard || !shardIsOk {
-				// double check whether the shard still belongs to this group after raft has commited the Op
-				// borrow the "Type" field to indicate that the shard no longer belongs to current group
-				op.Type = ErrWrongGroup
-				DPrintf(dWarn, dServer, kv, "but I'm not in charge of shard %v now, my shards: %+v", shard, kv.hasShard)
-			} else {
-				// for !shardIsOk {
-				// 	kv.mu.Unlock()
-				// 	shardIsOk = kv.hasShard[shard]
-				// 	kv.mu.Lock()
-				// }
-				maxSeq, found := kv.cid2MaxSeq[op.CId]
-				if !found || op.Seq > maxSeq {
-					if op.Seq > maxSeq {
-						if op.Seq == maxSeq+1 {
-							DPrintf(dInfo, dServer, kv, "Op [%v] is executed by kv because op.Seq (%v) > kv.cid2MaxSeq[%v] (%v)", op, op.Seq, op.CId, maxSeq)
+				shard := key2shard(op.Key)
+				// shardIsOk, hasShard := kv.hasShard[shard]
+				// if !shardIsOk || !hasShard {
+				if shardStatus, ok := kv.shardsStatus[shard]; !ok || shardStatus != READY {
+					// double check whether the shard still belongs to this group after raft has commited the Op
+					// borrow the "Type" field to indicate that the shard no longer belongs to current group
+					op.Type = ErrWrongGroup
+					DPrintf(dWarn, dServer, kv, "but I'm not in charge of shard %v now, my shards: %+v", shard, kv.shardsStatus)
+				} else {
+					maxSeq, found := kv.cid2MaxSeq[op.CId]
+					if !found || op.Seq > maxSeq {
+						if op.Seq > maxSeq {
+							if op.Seq == maxSeq+1 {
+								DPrintf(dInfo, dServer, kv, "Op [%v] is executed by kv because op.Seq (%v) > kv.cid2MaxSeq[%v] (%v)", op, op.Seq, op.CId, maxSeq)
+							} else {
+								DPrintf(dError, dServer, kv, "!!! Op [%v] .seq (%v) != kv.cid2MaxSeq[%v] (%v) + 1, Op may be lost", op, op.Seq, op.CId, maxSeq)
+							}
 						} else {
-							DPrintf(dError, dServer, kv, "!!! Op [%v] .seq (%v) != kv.cid2MaxSeq[%v] (%v) + 1, Op may be lost", op, op.Seq, op.CId, maxSeq)
+							DPrintf(dInfo, dServer, kv, "Op [%v] is executed by kv because op.CId (%v) is not found in kv.cid2MaxSeq (%v)", op, op.CId, kv.cid2MaxSeq)
+						}
+
+						kv.cid2MaxSeq[op.CId] = op.Seq
+						switch op.Type {
+						case PUT:
+							kv.db[op.Key] = op.Value
+						case APPEND:
+							kv.db[op.Key] += op.Value
+							DPrintf(dInfo, dServer, kv, "kv.db[%v] after appending %v: %v", op.Key, op.Value, kv.db[op.Key])
+						case GET:
+							// get the latest value, as kv.db may be updated by MigrateReply
+							// again, borrow the "Value" failed
+							op.Value = kv.db[op.Key]
 						}
 					} else {
-						DPrintf(dInfo, dServer, kv, "Op [%v] is executed by kv because op.CId (%v) is not found in kv.cid2MaxSeq (%v)", op, op.CId, kv.cid2MaxSeq)
+						DPrintf(dInfo, dServer, kv, "Op [%v] is not executed by kv, curMaxSeq[%v]: %v", op, op.CId, kv.cid2MaxSeq[op.CId])
 					}
-
-					kv.cid2MaxSeq[op.CId] = op.Seq
-					switch op.Type {
-					case PUT:
-						kv.db[op.Key] = op.Value
-					case APPEND:
-						kv.db[op.Key] += op.Value
-						DPrintf(dInfo, dServer, kv, "kv.db[%v] after appending %v: %v", op.Key, op.Value, kv.db[op.Key])
-					case GET:
-						// get the latest value, as kv.db may be updated by MigrateReply
-						// again, borrow the "Value" failed
-						op.Value = kv.db[op.Key]
-					}
-				} else {
-					DPrintf(dInfo, dServer, kv, "Op [%v] is not executed by kv, curMaxSeq[%v]: %v", op, op.CId, kv.cid2MaxSeq[op.CId])
 				}
-			}
 
-			if _, ok := kv.idx2OpChan[commandIndex]; ok {
-				kv.idx2OpChan[commandIndex] <- op
-			} else {
-				// current server is the follower, and received "appended entry" from the leader
-				// so there is no corresponding channel of the index
-				// DPrintf(dError, dServer, kv.me, "kv.idx2OpChan[index(%v)] does not exist", index)
-			}
+				if _, ok := kv.idx2OpChan[commandIndex]; ok {
+					kv.idx2OpChan[commandIndex] <- op
+				} else {
+					// current server is the follower, and received "appended entry" from the leader
+					// so there is no corresponding channel of the index
+					// DPrintf(dError, dServer, kv.me, "kv.idx2OpChan[index(%v)] does not exist", index)
+				}
 
-			if kv.maxraftstate != -1 && commandIndex != 0 && kv.rf.StateSize() > 7*kv.maxraftstate {
-				DPrintf(dSnap, dServer, kv, "kv.rf.StateSize(%v) > kv.maxraftstate(%v), calling kv.rf.Snapshot() with index %v", kv.rf.StateSize(), kv.maxraftstate, commandIndex)
-				snapshot := kv.makeSnapshot()
-				kv.rf.Snapshot(commandIndex, snapshot)
+				if kv.maxraftstate != -1 && commandIndex != 0 && kv.rf.StateSize() > 7*kv.maxraftstate {
+					DPrintf(dSnap, dServer, kv, "kv.rf.StateSize(%v) > kv.maxraftstate(%v), calling kv.rf.Snapshot() with index %v", kv.rf.StateSize(), kv.maxraftstate, commandIndex)
+					snapshot := kv.makeSnapshot()
+					kv.rf.Snapshot(commandIndex, snapshot)
+				}
+			} else if config, ok := msg.Command.(shardctrler.Config); ok {
+				kv.applyConfig(config)
+				DPrintf(dCONF, dServer, kv, "new config is received from applyCh, outShard: %v, inShards: %v", kv.shardsToBePulled, kv.shardsToPull2ConfigNum)
+			} else if migrateReply, ok := msg.Command.(MigrateReply); ok {
+				kv.applyMigratedShard(migrateReply)
+				DPrintf(dMIGA, dServer, kv, "MigrateReply is received from applyCh and applied, reply: %+v, kv.db: %+v", migrateReply, kv.db)
 			}
-			// } else if snapshot, ok := msg.Command.([]byte); ok {
 		} else if msg.SnapshotValid {
 			if msg.SnapshotIndex >= kv.maxCommandIndex {
 				DPrintf(dSnap, dServer, kv, "snapshot received and applied: index: %v, kv.maxIndex: %v", msg.SnapshotIndex, kv.maxCommandIndex)
@@ -387,12 +403,6 @@ func (kv *ShardKV) listener() {
 			} else {
 				DPrintf(dSnap, dServer, kv, "snapshot received but not applied: index: %v, kv.maxIndex: %v", msg.SnapshotIndex, kv.maxCommandIndex)
 			}
-		} else if config, ok := msg.Command.(shardctrler.Config); ok {
-			kv.updateInAndOutShard(config)
-			DPrintf(dCONF, dServer, kv, "new config is received from applyCh, index: %v, outShard: %v, inShards: %v", kv.shardsToBePulled, kv.shardsToPull2ConfigNum)
-		} else if migrateReply, ok := msg.Command.(MigrateReply); ok {
-			kv.applyMigratedShard(migrateReply)
-			DPrintf(dMIGA, dServer, kv, "MigrateReply is received from applyCh and applied, index: %v, reply: %+v, kv.db: %+v", migrateReply, kv.db)
 		} else {
 			DPrintf(dError, dServer, kv, "Command with unknown type, %+v", msg)
 		}
@@ -541,7 +551,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.shardsToBePulled = make(map[int]map[int]map[string]string)
 	kv.shardsToPull2ConfigNum = make(map[int]int)
-	kv.hasShard = make(map[int]bool)
+	// kv.hasShard = make(map[int]bool)
+	kv.shardsStatus = make(map[int]ShardStatus)
 
 	kv.maxCommandIndex = 0
 
