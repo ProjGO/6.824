@@ -527,8 +527,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// but we need to release the lock here to prevent deadlock
 	// example(if we still use 'defer mu.unlock() but not unlock manually here):
 	// the following "send to applyCh" is blocked, waiting for client(clerk) to read snapshot from applyCh
-	// and the client called InstallSnapshot, which needs to acquire the lock
-	// but raft can't release the lock unless the InstallSnapshot is returned and the client can read from applyCh
+	// and if at the same time the client called rf.Snapshot(), which needs to acquire rf.mu()
+	// but InstallSnapshot can't release the lock unless the client can read snapshot from applyCh
+	// (the client can only read from applyCh after the call of rf.Snapshot() is returned)
 	// => deadlock
 	rf.mu.Unlock()
 
@@ -665,8 +666,9 @@ func (rf *Raft) ticker() {
 					if i == rf.me {
 						rf.mu.Lock()
 						rf.VotedFor = rf.me
-						rf.mu.Unlock()
 						rf.persist()
+						rf.mu.Unlock()
+
 						muVotedCnt.Lock()
 						votedCnt++
 						muVotedCnt.Unlock()
@@ -965,6 +967,8 @@ func (rf *Raft) StateSize() int {
 }
 
 func (rf *Raft) GetSnapshot() []byte {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return rf.persister.snapshot
 }
 

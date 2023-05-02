@@ -38,10 +38,10 @@ const (
 )
 
 func init() {
-	debugVerbosity = 0
-	testVerbosity = 0
-	// debugVerbosity = 1
-	// testVerbosity = 1
+	// debugVerbosity = 0
+	// testVerbosity = 0
+	debugVerbosity = 1
+	testVerbosity = 1
 	mutedServer = make(map[int]bool)
 	debugStart = time.Now()
 
@@ -58,9 +58,10 @@ func unmuteServer(id int) {
 
 // hostId == -1 (<0) -> log from client
 // hostId >= 0 -> log from server
-func DPrintf(topic logTopic, role int, gid int, hostId int, format string, a ...interface{}) {
-	if hostId >= 0 {
-		isMuted, ok := mutedServer[hostId]
+// func DPrintf(topic logTopic, role int, gid int, hostId int, format string, a ...interface{}) {
+func DPrintf(topic logTopic, role int, kv *ShardKV, format string, a ...interface{}) {
+	if kv.me >= 0 {
+		isMuted, ok := mutedServer[kv.me]
 		if ok && isMuted {
 			return
 		}
@@ -71,9 +72,9 @@ func DPrintf(topic logTopic, role int, gid int, hostId int, format string, a ...
 		time /= 100
 		prefix := ""
 		if role == dServer {
-			prefix = fmt.Sprintf("%06d SHKV %v server %v:%v ", time, string(topic), gid, hostId)
+			prefix = fmt.Sprintf("%06d SHKV %v server %v:%v [%v] ", time, string(topic), kv.gid, kv.me, kv.config.Num)
 		} else if role == dClient {
-			prefix = fmt.Sprintf("%06d SHKV %v client %v:%v ", time, string(topic), gid, hostId%10000)
+			prefix = fmt.Sprintf("%06d SHKV %v client %v:%v ", time, string(topic), kv.gid, kv.me%10000)
 		}
 		format = prefix + format
 
@@ -101,6 +102,14 @@ func min(a int, b int) int {
 }
 
 func max(a int, b int) int {
+	if a > b {
+		return a
+	} else {
+		return b
+	}
+}
+
+func max64(a int64, b int64) int64 {
 	if a > b {
 		return a
 	} else {

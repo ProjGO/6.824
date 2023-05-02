@@ -33,6 +33,8 @@ type Clerk struct {
 	// You will have to modify this struct.
 	me  int
 	seq int64
+
+	leaderId int
 }
 
 // the tester calls MakeClerk.
@@ -68,7 +70,7 @@ func (ck *Clerk) Request(key string, value string, op string) string {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
+			for si := ck.leaderId; si < len(servers); si = (si + 1) % len(servers) {
 				srv := ck.make_end(servers[si])
 				var reply KvReply
 				ok := srv.Call("ShardKV.Request", &args, &reply)
