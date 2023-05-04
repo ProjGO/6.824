@@ -19,6 +19,8 @@ const (
 	ErrRetry       = "ErrRetry"
 
 	ErrOlderConfig = "ErrOlderConfig"
+
+	ErrAlreadyCollected = "ErrAlreadyCollected"
 )
 
 type Err string
@@ -76,4 +78,15 @@ type MigrateReply struct {
 	DB  map[string]string
 	// CId2MaxSeq map[int]int64
 	CId2MaxSeqAndReply map[int]SeqAndReply
+}
+
+// set final data of "Shard" in config with "ConfigNum" as garbage
+type GcArgs struct {
+	ConfigNum int
+	Shard     int
+}
+
+// seems that no data needs to be return
+type GcReply struct {
+	Err Err
 }

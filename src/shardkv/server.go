@@ -24,7 +24,7 @@ const (
 	TOBEPULLED ShardStatus = "TOBEPULLED"
 )
 
-type Op struct {
+type KvOp struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
@@ -34,6 +34,18 @@ type Op struct {
 	Type  string
 	Key   string
 	Value string
+}
+
+type GcOp struct {
+	ConfigNum int
+	Shard     int
+}
+
+// the execute result of listener on command commited by raft
+// at most time this just notify that the command has been commited and executed
+// but sometime this will carry some useful execute result information
+// for example, Get command, to carry the value required in listener() to ensure linearizability
+type ListenerResult struct {
 }
 
 type ShardKV struct {
@@ -49,9 +61,12 @@ type ShardKV struct {
 	// Your definitions here.
 	dead int32
 
-	sc                 *shardctrler.Clerk
-	db                 map[string]string
-	idx2OpChan         map[int]chan Op
+	sc *shardctrler.Clerk
+	db map[string]string
+	// TODO
+	// define and use a different type for idx2OpChan
+	// to notify any function that call a rf.Start() and need to wait until the command is commited by raft
+	idx2OpChan         map[int]chan KvOp
 	cid2MaxSeqAndReply map[int]SeqAndReply
 
 	maxCommandIndex int
@@ -59,7 +74,8 @@ type ShardKV struct {
 	config shardctrler.Config
 	// configNum -> (shard -> kv in shard)
 	// the shrads to be pulled in config with "configNum"
-	// (these shards will be pulled by others to make them transist from configNum to configNum+1)
+	// these shards will be pulled by others to make them transist from configNum to configNum+1
+	// or say, it stores the final state of a shard in the end of "configNum" config
 	shardsToBePulled map[int]map[int]map[string]string
 	// shard -> configNum
 	// to update the config to kv.config, which shards need to be pulled and which configNum shoud be used when calling ShardMigration
@@ -71,6 +87,12 @@ type ShardKV struct {
 	// which shard does this server can serve now
 	// the shards that are not assigned to this server in the current config SHOULD NOT appear in the map
 	shardsStatus map[int]ShardStatus
+
+	// configNum -> shard (the later map[int]bool is used as set)
+	// "the final state of shard in the end of configNum config is no more need"
+	// so this is modified by the pull side
+	// and is used to notify the pulled side to delete the corresponding data in "shardsToBePulled"
+	garbages map[int]map[int]bool
 }
 
 func (kv *ShardKV) Request(args *KvArgs, reply *KvReply) {
@@ -102,7 +124,7 @@ func (kv *ShardKV) Request(args *KvArgs, reply *KvReply) {
 	}
 	kv.mu.Unlock()
 
-	op := Op{
+	op := KvOp{
 		CId: args.CId,
 		Seq: args.Seq,
 
@@ -110,17 +132,22 @@ func (kv *ShardKV) Request(args *KvArgs, reply *KvReply) {
 		Key:   args.Key,
 		Value: args.Value,
 	}
+	DPrintf(dInfo, dServer, kv, "Request: starting Op: %+v on raft", op)
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		DPrintf(dWarn, dServer, kv, "%v failed, Key: %v, ErrWrongLeader", args.OpType, args.Key)
 		return
 	}
+	DPrintf(dInfo, dServer, kv, "Request: starting Op: %+v on raft...returned", op)
 
 	kv.mu.Lock()
-	kv.idx2OpChan[index] = make(chan Op)
+	kv.idx2OpChan[index] = make(chan KvOp)
 	ch := kv.idx2OpChan[index]
 	kv.mu.Unlock()
+	// the appliedOp may never appear in ch
+	// so timeout machenism need to be implemented here
+	// and the caller needs to retry if this returns any error
 	select {
 	case appliedOp := <-ch:
 		if appliedOp.CId != args.CId || appliedOp.Seq != args.Seq {
@@ -166,7 +193,10 @@ func (kv *ShardKV) Request(args *KvArgs, reply *KvReply) {
 }
 
 func (kv *ShardKV) ShardMigration(args *MigrateArgs, reply *MigrateReply) {
+	DPrintf(dInfo, dServer, kv, "ShardMigration: request received: %+v", args)
+	defer DPrintf(dInfo, dServer, kv, "ShardMigration: request received: %+v done, reply: %+v", args, reply)
 	_, isLeader := kv.rf.GetState()
+	DPrintf(dInfo, dServer, kv, "ShardMigration: got RaftState")
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
@@ -174,7 +204,7 @@ func (kv *ShardKV) ShardMigration(args *MigrateArgs, reply *MigrateReply) {
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	DPrintf(dInfo, dServer, kv, "ShardMigration request received, args: %+v", args)
+	DPrintf(dInfo, dServer, kv, "ShardMigration: request received: %+v, and got kv.mu", args)
 	reply.Err = OK
 	reply.Shard = args.Shard
 	reply.ConfigNum = args.ConfigNum
@@ -207,7 +237,77 @@ func (kv *ShardKV) ShardMigration(args *MigrateArgs, reply *MigrateReply) {
 		reply.CId2MaxSeqAndReply[cid] = maxSeqAndReply
 	}
 
-	DPrintf(dInfo, dServer, kv, "ShardMigration done, reply: %+v", reply)
+	// DPrintf(dInfo, dServer, kv, "ShardMigration done, reply: %+v", reply)
+}
+
+func (kv *ShardKV) GC(args *GcArgs, reply *GcReply) {
+	DPrintf(dGC, dServer, kv, "GC: request received: %+v", args)
+	defer DPrintf(dGC, dServer, kv, "GC: request %+v done, reply: %+v", args, reply)
+	_, isLeader := kv.rf.GetState()
+	DPrintf(dInfo, dServer, kv, "GC: got RaftState")
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	DPrintf(dGC, dServer, kv, "GC: request received: %+v, and got kv.mu", args)
+	// -CHECK
+	// when the following if statement is true
+	if _, ok := kv.shardsToBePulled[args.ConfigNum]; !ok {
+		reply.Err = ErrAlreadyCollected
+		kv.mu.Unlock()
+		return
+	}
+	if _, ok := kv.shardsToBePulled[args.ConfigNum][args.Shard]; !ok {
+		reply.Err = ErrAlreadyCollected
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	gcOp := GcOp{
+		ConfigNum: args.ConfigNum,
+		Shard:     args.Shard,
+	}
+	DPrintf(dInfo, dServer, kv, "GC: staring Op: %+v", gcOp)
+	index, _, isLeader := kv.rf.Start(gcOp)
+	DPrintf(dInfo, dServer, kv, "GC: staring Op: %+v...done", gcOp)
+	if !isLeader {
+		DPrintf(dGC, dServer, kv, "GC failed, Args: %+v, ErrWrongLeader", args)
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	kv.idx2OpChan[index] = make(chan KvOp)
+	ch := kv.idx2OpChan[index]
+	kv.mu.Unlock()
+	select {
+	case <-ch:
+		DPrintf(dGC, dServer, kv, "GC success, Args: %+v", args)
+		reply.Err = OK
+	case <-time.After(1 * time.Second):
+		DPrintf(dGC, dServer, kv, "GC failed, Args: %+v, ErrRetry(commit timeout)", args)
+		reply.Err = ErrRetry
+	}
+
+	// HINT
+	// DO NOT forget to close the channel and delete it from map, THEY ARE NECESSARY
+	// no close & delete => a silence deadlock
+	// only close => ok to run, but leave some garbage channel
+	// only delete => go panic: send to a closed channel
+
+	// because you may come here via a timeout instead of read something from the channel
+	// in some cases, the timeout happend and GC returned
+	// if the channel is not deleted from map then listener may write to a channel that will never be read then be stucked forever
+
+	// CHECK
+	// when the above case will happen
+	kv.mu.Lock()
+	close(kv.idx2OpChan[index])
+	delete(kv.idx2OpChan, index)
+	kv.mu.Unlock()
 }
 
 func (kv *ShardKV) applyConfig(config shardctrler.Config) {
@@ -278,7 +378,7 @@ func (kv *ShardKV) applyConfig(config shardctrler.Config) {
 		for k, v := range kv.db {
 			if key2shard(k) == shard {
 				outDb[k] = v
-				// delete(kv.db, k)
+				delete(kv.db, k)
 			}
 		}
 		kv.shardsToBePulled[oldConfig.Num][shard] = outDb
@@ -300,29 +400,57 @@ func (kv *ShardKV) applyMigratedShard(reply MigrateReply) {
 			kv.db[k] = v
 		}
 		for k, v := range reply.CId2MaxSeqAndReply {
-			// -CHECK (TestConcurrent1/3)
-			// why we need to judge which one is larger before update?
+			// +CHECK (TestConcurrent1/3)
+			// why we need to check which one is larger before update?
+			// +ANS: the maxSeq is used by CId, instead of (CId, shard)
+			//       => Ops of other shard my also update cid2MaxSeqAndReply
+			//       => check before update
 			if v.Seq > kv.cid2MaxSeqAndReply[k].Seq {
 				kv.cid2MaxSeqAndReply[k] = v
 			}
 			// kv.cid2MaxSeqAndReply[k] = v
 		}
 		kv.shardsStatus[reply.Shard] = READY
+
+		// the MigrateReply is received from applyCh and is applied
+		// so at this point we can confirm that the pulled side doesn't need to keep the "shard's final state" any more
+		// as these data has been stored by this group (in raft's log, by a MigrateReply entry)
+		if _, ok := kv.garbages[reply.ConfigNum]; !ok {
+			kv.garbages[reply.ConfigNum] = make(map[int]bool)
+		}
+		kv.garbages[reply.ConfigNum][reply.Shard] = true
+		DPrintf(dGC, dServer, kv, "applyMigratedShard: ConfigNum: %v, Shard: %v has been marked as garbage", reply.ConfigNum, reply.Shard)
 	} else {
 		DPrintf(dWarn, dServer, kv, "applyMigratedShard: but I'm not in charge of shard %v, my shards: %+v", reply.Shard, kv.shardsStatus)
 	}
+}
+
+func (kv *ShardKV) applyGc(gcOp GcOp) {
+	configNum := gcOp.ConfigNum
+	shard := gcOp.Shard
+
+	DPrintf(dGC, dServer, kv, "applyGc: size before deletion: %v", sizeOf(kv.shardsToBePulled))
+	if _, ok := kv.shardsToBePulled[configNum][shard]; ok {
+		delete(kv.shardsToBePulled[configNum], shard)
+		DPrintf(dGC, dServer, kv, "applyGc: shardsToBePulled[configNum(%v)][shard(%v)] has been deleted", configNum, shard)
+		if len(kv.shardsToBePulled[configNum]) == 0 {
+			DPrintf(dGC, dServer, kv, "applyGc: shardsToBePulled[configNum(%v)] has been deleted", configNum)
+			delete(kv.shardsToBePulled, configNum)
+		}
+	}
+	DPrintf(dGC, dServer, kv, "applyGc: size after deletion: %v\n\tshardsToBePulled: %v", sizeOf(kv.shardsToBePulled), printShardsToBePulled(kv.shardsToBePulled))
 }
 
 func (kv *ShardKV) makeSnapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.db)
-	// e.Encode(kv.cid2MaxSeq)
 	e.Encode(kv.cid2MaxSeqAndReply)
 	e.Encode(kv.config)
 	e.Encode(kv.shardsToBePulled)
 	e.Encode(kv.shardsToPull2ConfigNum)
 	e.Encode(kv.shardsStatus)
+	e.Encode(kv.garbages)
 
 	return w.Bytes()
 }
@@ -339,6 +467,7 @@ func (kv *ShardKV) applySnapshot(snapshot []byte) {
 	var shardsToBePulled map[int]map[int]map[string]string
 	var shardsToPull2ConfigNum map[int]int
 	var shardsStatus map[int]ShardStatus
+	var garbages map[int]map[int]bool
 
 	// TODO
 	// find out a neater implementation
@@ -360,6 +489,9 @@ func (kv *ShardKV) applySnapshot(snapshot []byte) {
 	if err := d.Decode(&shardsStatus); err != nil {
 		DPrintf(dError, dServer, kv, "applySnapshot: failed to decode shardsStatus, error: %v", err)
 	}
+	if err := d.Decode(&garbages); err != nil {
+		DPrintf(dError, dServer, kv, "applySnapshot: failed to decode garbages, error: %v", err)
+	}
 
 	if config.Num > kv.config.Num {
 		DPrintf(dWarn, dServer, kv, "update to new config via a Snapshot: new config: %+v, new shardsStatus: %+v", config, shardsStatus)
@@ -371,6 +503,7 @@ func (kv *ShardKV) applySnapshot(snapshot []byte) {
 	kv.shardsToBePulled = shardsToBePulled
 	kv.shardsToPull2ConfigNum = shardsToPull2ConfigNum
 	kv.shardsStatus = shardsStatus
+	kv.garbages = garbages
 }
 
 func (kv *ShardKV) listener() {
@@ -388,7 +521,7 @@ func (kv *ShardKV) listener() {
 		// if op, ok := msg.Command.(Op); ok {
 		if msg.CommandValid {
 			commandIndex := msg.CommandIndex
-			if op, ok := msg.Command.(Op); ok {
+			if op, ok := msg.Command.(KvOp); ok {
 				kv.maxCommandIndex = max(kv.maxCommandIndex, commandIndex)
 				DPrintf(dInfo, dServer, kv, "Op [%v] is commited by raft, index: %v, kv.maxIndex: %v", op, commandIndex, kv.maxCommandIndex)
 
@@ -461,18 +594,34 @@ func (kv *ShardKV) listener() {
 					// so there is no corresponding channel of the index
 					// DPrintf(dError, dServer, kv.me, "kv.idx2OpChan[index(%v)] does not exist", index)
 				}
-
-				if kv.maxraftstate != -1 && commandIndex != 0 && kv.rf.StateSize() > 7*kv.maxraftstate {
-					DPrintf(dSnap, dServer, kv, "kv.rf.StateSize(%v) > kv.maxraftstate(%v), calling kv.rf.Snapshot() with index %v", kv.rf.StateSize(), kv.maxraftstate, commandIndex)
-					snapshot := kv.makeSnapshot()
-					kv.rf.Snapshot(commandIndex, snapshot)
-				}
 			} else if config, ok := msg.Command.(shardctrler.Config); ok {
 				kv.applyConfig(config)
-				DPrintf(dCONF, dServer, kv, "new config is received from applyCh, outShard: %v, inShards: %v", kv.shardsToBePulled, kv.shardsToPull2ConfigNum)
+				// DPrintf(dCONF, dServer, kv, "new config is received from applyCh, outShard: %v, inShards: %v", kv.shardsToBePulled, kv.shardsToPull2ConfigNum)
+				DPrintf(dCONF, dServer, kv, "new config is received from applyCh")
 			} else if migrateReply, ok := msg.Command.(MigrateReply); ok {
 				kv.applyMigratedShard(migrateReply)
-				DPrintf(dMIGA, dServer, kv, "MigrateReply is received from applyCh and applied, reply: %+v, kv.db: %+v", migrateReply, kv.db)
+				// DPrintf(dMIGA, dServer, kv, "MigrateReply is received from applyCh and applied, reply: %+v, kv.db: %+v", migrateReply, kv.db)
+				DPrintf(dMIGA, dServer, kv, "MigrateReply is received from applyCh and applied")
+			} else if gcOp, ok := msg.Command.(GcOp); ok {
+				commandIndex := msg.CommandIndex
+				kv.applyGc(gcOp)
+				DPrintf(dGC, dServer, kv, "listener: GcRequest %+v has been executed", gcOp)
+				if _, ok := kv.idx2OpChan[commandIndex]; ok {
+					op := KvOp{}
+					kv.idx2OpChan[commandIndex] <- op
+				}
+				DPrintf(dGC, dServer, kv, "listener: GcRequest %+v has been executed...and notified GC", gcOp)
+			}
+
+			// HINT (TestChallenge1Delete)
+			// 	Now KvOp is not the only type of command that will be put to the raft's log
+			// 	so the old implementation (check raft's stateSize and make snapshot only when KvOp is received) is not right any more
+			// 	instead we should perform this check & makeSnapshot for every command
+			// 	or TestChallenge1Delete would fail
+			if kv.maxraftstate != -1 && commandIndex != 0 && kv.rf.StateSize() > 7*kv.maxraftstate {
+				DPrintf(dSnap, dServer, kv, "kv.rf.StateSize(%v) > kv.maxraftstate(%v), calling kv.rf.Snapshot() with index %v", kv.rf.StateSize(), kv.maxraftstate, commandIndex)
+				snapshot := kv.makeSnapshot()
+				kv.rf.Snapshot(commandIndex, snapshot)
 			}
 		} else if msg.SnapshotValid {
 			if msg.SnapshotIndex >= kv.maxCommandIndex {
@@ -513,18 +662,23 @@ func (kv *ShardKV) updateConfig() {
 	if newConfig.Num == kv.config.Num+1 {
 		DPrintf(dCONF, dServer, kv, "new config is found and put to raft:\n\told config: %+v,\n\tnew config: %+v", kv.config, newConfig)
 		kv.rf.Start(newConfig)
+		DPrintf(dCONF, dServer, kv, "new config is found and put to raft:\n\told config: %+v,\n\tnew config: %+v\n\t...done", kv.config, newConfig)
 	}
 	kv.mu.Unlock()
 }
 
 func (kv *ShardKV) pullShard() {
 	if _, isLeader := kv.rf.GetState(); !isLeader {
+		DPrintf(dMIGA, dServer, kv, "pullShard: but I'm not the leader")
 		return
 	}
 
 	kv.mu.Lock()
 	var wait sync.WaitGroup
 	for shard, configNum := range kv.shardsToPull2ConfigNum {
+		// HINT
+		//  execute wait.Add(1) before calling the go func
+		//  or "wait" may become negative
 		wait.Add(1)
 		go func(shard int, config shardctrler.Config) {
 			defer wait.Done()
@@ -534,22 +688,70 @@ func (kv *ShardKV) pullShard() {
 			// and Query() will handle this (return the latest config if request.Num > largest configNum)
 			args := MigrateArgs{shard, config.Num}
 			gid := config.Shards[shard]
+			// just-try-once instead of try-until-success
+			// as the whole pullShard() will be called periodically and indefinitely by a daemon
+			// +CHECK:
+			// no timeout protection is needed ?
+			// the ShardMigration is non-block
+			// so the only caurse of timeout is network failure, but this it coped by RPC lib
 			for _, server := range config.Groups[gid] {
 				srv := kv.make_end(server)
 				reply := MigrateReply{}
-				srv.Call("ShardKV.ShardMigration", &args, &reply)
+				DPrintf(dMIGA, dServer, kv, "pullShard: calling ShardMigration to %v, args: %+v", server, args)
+				ok := srv.Call("ShardKV.ShardMigration", &args, &reply)
 				// HINT
 				// apply the reply only if the pulled server is at least as new as this one is
 				// if all of the expected servers are not ok (due to lagging, crashing, network failure, etc)
-				// the no MigrateReply will be applied, and the state of the pulled shard (hasShard, which is updated to "true" in applyMigratedShard) will state "unusable" (hasShard[shard] = false)
+				// then no MigrateReply will be applied, and the state of the pulled shard (hasShard, which is updated to "true" in applyMigratedShard) will state "unusable" (hasShard[shard] = false)
 				// and the server won't serve the request related to that shard, so everything is ok
+				// if ok && reply.Err == OK {
 				if reply.Err == OK {
 					kv.rf.Start(reply)
 					// if anyone is OK, the stop asking for others
 					break
+				} else {
+					DPrintf(dMIGA, dServer, kv, "pullShard: failed to call ShardMigration to %v, args: %+v, Call.ok: %v, reply.Err: %+v", server, args, ok, reply.Err)
 				}
 			}
 		}(shard, kv.sc.Query(configNum))
+	}
+	kv.mu.Unlock()
+	wait.Wait()
+}
+
+func (kv *ShardKV) checkGarbage() {
+	defer DPrintf(dInfo, dServer, kv, "checkGarbage: done")
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		DPrintf(dWarn, dServer, kv, "checkGarbage: garbages: %+v, but I'm not the leader", kv.garbages)
+		return
+	}
+
+	kv.mu.Lock()
+	DPrintf(dGC, dServer, kv, "checkGarbage(got lock): garbages: %+v", kv.garbages)
+	var wait sync.WaitGroup
+	for configNum, shards := range kv.garbages {
+		for shard := range shards {
+			wait.Add(1)
+			go func(configNum int, shard int, config shardctrler.Config) {
+				args := GcArgs{ConfigNum: configNum, Shard: shard}
+				gid := config.Shards[shard]
+				DPrintf(dGC, dServer, kv, "checkGarbage: found garbage and sending request %+v to group %v", args, gid)
+				for _, server := range config.Groups[gid] {
+					srv := kv.make_end(server)
+					reply := GcReply{}
+					if ok := srv.Call("ShardKV.GC", &args, &reply); ok && reply.Err == OK {
+						kv.mu.Lock()
+						delete(kv.garbages[configNum], shard)
+						if len(kv.garbages[configNum]) == 0 {
+							delete(kv.garbages, configNum)
+						}
+						DPrintf(dGC, dServer, kv, "checkGarbage: GC request %+v has been executed successful by group %v, current garbages: %+v", args, gid, kv.garbages)
+						kv.mu.Unlock()
+					}
+				}
+				wait.Done()
+			}(configNum, shard, kv.sc.Query(configNum))
+		}
 	}
 	kv.mu.Unlock()
 	wait.Wait()
@@ -559,6 +761,7 @@ func (kv *ShardKV) daemon(do func(), sleepMs int) {
 	for {
 		dead := atomic.LoadInt32(&kv.dead)
 		if dead == 1 {
+			DPrintf(dWarn, dServer, kv, "daemon is dead")
 			return
 		}
 		do()
@@ -605,9 +808,10 @@ func (kv *ShardKV) Kill() {
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(KvOp{})
 	labgob.Register(shardctrler.Config{})
 	labgob.Register(MigrateReply{})
+	labgob.Register(GcOp{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -628,14 +832,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.dead = 0
 
 	kv.db = make(map[string]string)
-	kv.idx2OpChan = make(map[int]chan Op)
-	// kv.cid2MaxSeq = make(map[int]int64)
+	kv.idx2OpChan = make(map[int]chan KvOp)
 	kv.cid2MaxSeqAndReply = make(map[int]SeqAndReply)
 
 	kv.shardsToBePulled = make(map[int]map[int]map[string]string)
 	kv.shardsToPull2ConfigNum = make(map[int]int)
-	// kv.hasShard = make(map[int]bool)
 	kv.shardsStatus = make(map[int]ShardStatus)
+	kv.garbages = make(map[int]map[int]bool)
 
 	kv.maxCommandIndex = 0
 
@@ -647,8 +850,28 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	}
 
 	go kv.listener()
-	go kv.daemon(kv.updateConfig, 50)
-	go kv.daemon(kv.pullShard, 50)
+	// HINT
+	// 	After adding GC related code, the frequency of pullShard needs to be increased to pass TestChallenge2Unaffected
+	// case:
+	// 	In TestUnaffected, the network is unreliable, and the shard migration need to be done in 1s (shards pulled by 101 from 100) then group 100 will be killed
+	//  if during this 1s, all the ShardMigrate RPC sent to the leader of group 100 is missed due to network failure
+	//  then group 101 will never be able to get the shard data after group 100 has been shutdown
+	// 	and client's request to the unmigrated shard will never be done and test will be stucked forever
+
+	// CHECK:
+	// 	 before add the GC related code, everything works fine with 50ms interval of pullShard daemon
+	// 	 and after adding GC, even if checkGarbage daemon is not started (which means that nearly all GC related processes are not executed)
+	//   the test may still be stucked
+	//   so what makes everything slow down, or is above HINT is ringt?
+	// another evidence of above HINT:
+	//  if we keep the 50ms interval, and set the time window for shard migration to 3s
+	//	then the failure rate will decrease significantly (<1%, which is comparable with no GC version)
+
+	// go kv.daemon(kv.updateConfig, 50)
+	// go kv.daemon(kv.pullShard, 50)
+	go kv.daemon(kv.updateConfig, 10)
+	go kv.daemon(kv.pullShard, 10)
+	go kv.daemon(kv.checkGarbage, 100)
 
 	return kv
 }

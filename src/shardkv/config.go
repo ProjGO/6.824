@@ -202,6 +202,7 @@ func (cfg *config) ShutdownGroup(gi int) {
 	for i := 0; i < cfg.n; i++ {
 		cfg.ShutdownServer(gi, i)
 	}
+	TPrintf("group %v has been shutdown", gi)
 }
 
 // start i'th server in gi'th group

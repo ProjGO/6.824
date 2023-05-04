@@ -747,6 +747,7 @@ func TestChallenge1Delete(t *testing.T) {
 
 	ck := cfg.makeClient()
 
+	// 1
 	cfg.join(0)
 
 	// 30,000 bytes of total values.
@@ -763,14 +764,19 @@ func TestChallenge1Delete(t *testing.T) {
 	}
 
 	for iters := 0; iters < 2; iters++ {
+		// 2
 		cfg.join(1)
+		// 3
 		cfg.leave(0)
+		// 4
 		cfg.join(2)
 		time.Sleep(3 * time.Second)
 		for i := 0; i < 3; i++ {
 			check(t, ck, ka[i], va[i])
 		}
+		// 5
 		cfg.leave(1)
+		// 6
 		cfg.join(0)
 		cfg.leave(2)
 		time.Sleep(3 * time.Second)
@@ -799,6 +805,7 @@ func TestChallenge1Delete(t *testing.T) {
 		for i := 0; i < cfg.n; i++ {
 			raft := cfg.groups[gi].saved[i].RaftStateSize()
 			snap := len(cfg.groups[gi].saved[i].ReadSnapshot())
+			TPrintf("%v:%v: raftStateSize: %v, snapshotSize: %v", gi, i, raft, snap)
 			total += raft + snap
 		}
 	}
@@ -826,6 +833,7 @@ func TestChallenge2Unaffected(t *testing.T) {
 	fmt.Printf("Test: unaffected shard access (challenge 2) ...\n")
 
 	cfg := make_config(t, 3, true, 100)
+	// cfg := make_config(t, 3, false, 100)
 	defer cfg.cleanup()
 
 	ck := cfg.makeClient()
@@ -857,6 +865,7 @@ func TestChallenge2Unaffected(t *testing.T) {
 	// start using this updated config. Gets to any key k such that
 	// owned[shard(k)] == true should now be served by group 101.
 	<-time.After(1 * time.Second)
+	// <-time.After(3 * time.Second)
 	for i := 0; i < n; i++ {
 		if owned[i] {
 			va[i] = "101"
