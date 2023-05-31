@@ -49,15 +49,18 @@ package labrpc
 //   pass svc to srv.AddService()
 //
 
-import "6.5840/labgob"
-import "bytes"
-import "reflect"
-import "sync"
-import "log"
-import "strings"
-import "math/rand"
-import "time"
-import "sync/atomic"
+import (
+	"bytes"
+	"log"
+	"math/rand"
+	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"6.5840/labgob"
+)
 
 type reqMsg struct {
 	endname  interface{} // name of sending ClientEnd
@@ -103,6 +106,7 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 		// the request has been sent.
 	case <-e.done:
 		// entire Network has been destroyed.
+		// fmt.Printf("labrpc.go::call: send request failed, e.done\n")
 		return false
 	}
 
@@ -118,6 +122,7 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 		}
 		return true
 	} else {
+		// fmt.Printf("labrpc.go::call: get reply failed\n")
 		return false
 	}
 }
