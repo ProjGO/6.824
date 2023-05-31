@@ -1,0 +1,16 @@
+duplicate MigrateReply
+    In a new config a shard is assigned to the server but the server doesn't have the data of this shard.
+    So it can't serve for this shard and needs to send MigrateRequest to the server that is responsible for the shard in last config.
+    The MigrateRequest is sent periodically by a daemon. The daemon will send every request in a seperate go routine.
+    So every request is processed asyncronisely and will be sent mutiple times until one of them have a "OK" response.
+    => There will be duplicated MigrateReply
+
+    What if we don't deal with this?
+    shard is "to be pulled" -> MigrateReply is received -> shard is "ok to server" -> new Append request comes, and commited by raft, executed by kv, responsed to client
+    -> duplicated MigrateReply comes -> the superseded shard data in MigrateReply overwrites the newer shard data
+    -> the commited Append Op between MigrateReply is lost
+
+    Solution
+        Apply a MigrateReply only when the corresponding shard status is "to be pulled"
+        And set the shard status to "ok to server" once after the MigrateReply is applied.
+    

@@ -1,0 +1,31 @@
+貌似
+    100:0卡在了kv.rf.GetState()
+    然后导致
+        101:2的GC一直无法返回,进而导致其checkGarbage daemon被卡住
+            搜一下101:2的checkGarbage的数量可以证实这点
+        102:0的"Call("sharedkv.ShardMigration)"一直无法返回,进而导致其pullShard daemon被卡住
+            搜一下102:0的pullShard数量可以证实这点
+
+    (100:0的GC和ShardMigration卡死是肯定的,但到底是不是卡在kv.rf.GetState()并不是很确定)
+    是rf.GetState()拿不到rf.mu?
+        并不是
+    是这个两个都拿不到kv.mu了
+
+***这个问题好像在加GC之前就有,但出现概率极低
+    也可能是看错了
+
+solve:
+    GC()最后忘了close channel并且从idx2OpCh里删掉对应项了。
+    导致GC那个等raft applyCh的地方因为timeout返回了
+        (可能是网有问题导致raft没有成功commit)
+    之后网络恢复,listener又收到了raft commit的那个GcOp,但是这时那个notifyChan已经不会再有人去读了
+    所以listener会直接卡死在向那个ch发送那一句上面
+
+    所以GC返回前close和delete是必须的(delete from map更必须一点),总之就是
+    不close也不delete
+        => listener发现这个ch还在,所以往里写,但没有人读 => 卡死
+    只close不delete
+        => listener以为这个ch还在,但这个ch已经被close了 => 触发go panic,至少会显式地报错并退出
+    只delete不close
+        => listener在map中找不到这个ch了,所以不会尝试send,外部表现为一切正常
+           但会留下一个没用的channel

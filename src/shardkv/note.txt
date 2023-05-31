@@ -1,0 +1,86 @@
+after reconstruct
+    StaticShards
+        500 ok
+
+    JoinLeave
+        500 ok
+
+    Snapshot
+        500 ok
+
+    MissChange
+        500 ok
+
+    Unreliable 1 (10 instances concurrent)
+        500 stucked
+        500 ok
+        500 stucked (till 393)
+        500 stucked (till 208)
+
+        after "term with no log" check
+        500 ok (10 instances)
+        500 stucked (50 instances concurrent, till 63)
+        100 ok
+        100 ok
+        100 ok
+        100 ok
+        100 ok
+        100 ok
+
+
+    Unreliable 2
+        500 ok
+        500 stucked (till 443)
+        500 ok
+        500 ok
+        500 ok
+
+    Unreliable 3
+        500 stucked
+        500 stucked (till 489)
+
+        after "term with no log" check
+        100 ok
+        100 ok
+        100 ok
+        100 ok
+        100 ok
+        100 ok
+    
+    Concurrent1
+        500 ok
+    Concurrent2
+        500 ok
+
+    Concurrent3
+        // even run only 1 test instance at once, the failure still appears
+        500 () 2 failed
+            === RUN   TestConcurrent3
+            Test: concurrent configuration change and restart...
+                test_test.go:22: Get(8): expected:
+                    gPsHI-r5Tp1nGG5s1HTJdKAN-orbCqYIaCiGouhcCmcWypByfHParJu3GzMWfkC1J2MXXeI6JHIo0HlVkc-xdacWtG6M2_Z4kiFlMvQat0a8dqrW9BDO
+                    received:
+                    gPsHI-r5Tp1nGG5s1HTJdKAN-orbCqYIaCiGouhcCmcWypByfHParJu3GzMfkC1J2MXXeI6JHIo0HlVkc-xdacWtG6M2_Z4kiFlMvQat0a8dqrW9BDO
+            --- FAIL: TestConcurrent3 (18.97s)
+
+            === RUN   TestConcurrent3
+            Test: concurrent configuration change and restart...
+                test_test.go:22: Get(4): expected:
+                    _uf_MeVCE42UE7HKHGT0qVHtoisKIDGOt--l7CFRwLeTypx1iCe87_qX99cohi2cWHmVk1yZiKZf8UUoU-1agcHynw7s0b8g0IP3xoDg4adCdfyZBeGrL4
+                    received:
+                    _uf_MeVCE42UE7HKHGT0qVHtoisKIDGOt--l7CFRwLeTypx1iCe87_qX99cohi2cWHmVk1yZiKZf8UUoU-1agcHynw7s0b8g0IP3xoDg4adCdfyZBeGr4
+            --- FAIL: TestConcurrent3 (19.76s)
+        500 2 failed
+        
+
+    Challenge1
+        300 ok
+    
+    Challenge2Unaffected
+        100 ok
+        100 ok
+        100 ok
+        200 stucked (50 ok)
+
+    Challenge2Partial
+        210 ok

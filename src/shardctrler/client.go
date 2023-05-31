@@ -97,6 +97,7 @@ func (ck *Clerk) Request(args Args) Reply {
 				return reply
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		// time.Sleep(100 * time.Millisecond)
+		time.Sleep(30 * time.Millisecond)
 	}
 }

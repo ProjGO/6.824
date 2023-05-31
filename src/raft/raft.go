@@ -43,6 +43,7 @@ import (
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
+	CommandTerm  int
 	CommandIndex int
 
 	// For 2D:
@@ -586,6 +587,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
+func (rf *Raft) HasLogInCurrentTerm() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.Log.last().Term == rf.CurrentTerm
+}
+
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -950,6 +958,7 @@ func (rf *Raft) applier() {
 				CommandValid: true,
 				Command:      rf.Log.at(rf.lastApplied).Command,
 				CommandIndex: rf.lastApplied,
+				CommandTerm:  rf.CurrentTerm,
 			}
 
 			rf.mu.Unlock()

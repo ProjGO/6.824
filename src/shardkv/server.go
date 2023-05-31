@@ -24,6 +24,16 @@ const (
 	TOBEPULLED ShardStatus = "TOBEPULLED"
 )
 
+type CommandType uint8
+
+const (
+	KVOP CommandType = iota
+	CONFIGURATION
+	INSERTSHARD
+	GC
+	EMPTYENTRY
+)
+
 type KvOp struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
@@ -41,11 +51,29 @@ type GcOp struct {
 	Shard     int
 }
 
+type KvResult struct {
+	CId int
+	Seq int64
+
+	Value string
+}
+
+type Command struct {
+	Type CommandType
+
+	Data interface{}
+}
+
 // the execute result of listener on command commited by raft
 // at most time this just notify that the command has been commited and executed
 // but sometime this will carry some useful execute result information
 // for example, Get command, to carry the value required in listener() to ensure linearizability
-type ListenerResult struct {
+type ExecuteResult struct {
+	Type CommandType
+
+	Err  Err
+	Data interface{}
+	// Data string
 }
 
 type ShardKV struct {
@@ -66,7 +94,7 @@ type ShardKV struct {
 	// TODO
 	// define and use a different type for idx2OpChan
 	// to notify any function that call a rf.Start() and need to wait until the command is commited by raft
-	idx2OpChan         map[int]chan KvOp
+	idx2NotifyChan     map[int]chan ExecuteResult
 	cid2MaxSeqAndReply map[int]SeqAndReply
 
 	maxCommandIndex int
@@ -93,6 +121,67 @@ type ShardKV struct {
 	// so this is modified by the pull side
 	// and is used to notify the pulled side to delete the corresponding data in "shardsToBePulled"
 	garbages map[int]map[int]bool
+}
+
+func (kv *ShardKV) execute(command Command, syncExec bool) ExecuteResult {
+	DPrintf(dInfo, dServer, kv, "execute: %+v start", command)
+
+	executeResult := ExecuteResult{
+		Type: command.Type,
+	}
+
+	index, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		executeResult.Err = ErrWrongLeader
+		DPrintf(dWarn, dServer, kv, "execute: %+v failed, ErrWrongLeader", command)
+		return executeResult
+	}
+
+	kv.mu.Lock()
+	kv.idx2NotifyChan[index] = make(chan ExecuteResult)
+	ch := kv.idx2NotifyChan[index]
+	kv.mu.Unlock()
+
+	if syncExec {
+		// the appliedOp may never appear in ch
+		// so timeout machenism need to be implemented here
+		// and the caller needs to retry if this returns any error
+		select {
+		case executeResult = <-ch:
+			DPrintf(dInfo, dServer, kv, "execute: %+v, syncExec and done", command)
+		case <-time.After(1 * time.Second):
+			DPrintf(dWarn, dServer, kv, "execute: %+v, syncExec but timeout", command)
+			executeResult.Err = ErrRetry
+		}
+		// HINT
+		// DO NOT forget to close the channel and delete it from map, THEY ARE NECESSARY
+		// no close & delete => a silence deadlock
+		// only close => ok to run, but leave some garbage channel
+		// only delete => go panic: send to a closed channel
+
+		// because you may come here via a timeout instead of read something from the channel
+		// in some cases, the timeout happend and execute returned
+		// if the channel is not deleted from map then listener may write to a channel that will never be read then be stucked forever
+
+		// CHECK
+		// when the above case will happen
+		kv.mu.Lock()
+		close(ch)
+		delete(kv.idx2NotifyChan, index)
+		kv.mu.Unlock()
+		return executeResult
+	} else {
+		executeResult.Err = OK
+		go func() {
+			<-ch
+			DPrintf(dInfo, dServer, kv, "execute: %+v, non-syncExec and now is done", command)
+			kv.mu.Lock()
+			close(ch)
+			delete(kv.idx2NotifyChan, index)
+			kv.mu.Unlock()
+		}()
+		return executeResult
+	}
 }
 
 func (kv *ShardKV) Request(args *KvArgs, reply *KvReply) {
@@ -124,72 +213,47 @@ func (kv *ShardKV) Request(args *KvArgs, reply *KvReply) {
 	}
 	kv.mu.Unlock()
 
-	op := KvOp{
-		CId: args.CId,
-		Seq: args.Seq,
+	command := Command{
+		Type: KVOP,
 
-		Type:  args.OpType,
-		Key:   args.Key,
-		Value: args.Value,
+		Data: KvOp{
+			CId: args.CId,
+			Seq: args.Seq,
+
+			Type:  args.OpType,
+			Key:   args.Key,
+			Value: args.Value,
+		},
 	}
-	DPrintf(dInfo, dServer, kv, "Request: starting Op: %+v on raft", op)
-	index, _, isLeader := kv.rf.Start(op)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		DPrintf(dWarn, dServer, kv, "%v failed, Key: %v, ErrWrongLeader", args.OpType, args.Key)
+	executeResult := kv.execute(command, true)
+	if executeResult.Err != OK {
+		reply.Err = executeResult.Err
 		return
 	}
-	DPrintf(dInfo, dServer, kv, "Request: starting Op: %+v on raft...returned", op)
+	kvResult := executeResult.Data.(KvResult)
 
-	kv.mu.Lock()
-	kv.idx2OpChan[index] = make(chan KvOp)
-	ch := kv.idx2OpChan[index]
-	kv.mu.Unlock()
-	// the appliedOp may never appear in ch
-	// so timeout machenism need to be implemented here
-	// and the caller needs to retry if this returns any error
-	select {
-	case appliedOp := <-ch:
-		if appliedOp.CId != args.CId || appliedOp.Seq != args.Seq {
-			// +CHECK: in what circumstance this will happen?
-			// +ANS: the original Op is not actually commited by raft
-			//       instead another Op commited by another raft server with the same index is sent to applyCh
-			reply.Err = ErrRetry
-		} else if appliedOp.Type == ErrWrongGroup {
-			reply.Err = ErrWrongGroup
-		} else {
-			reply.Err = OK
-			if op.Type == GET {
-				// kv.mu.Lock()
-				// value, keyExist := kv.db[op.Key]
-				// reply.Value = value
-				// if !keyExist {
-				// 	reply.Value = ""
-				// 	reply.Err = ErrNoKey
-				// }
-				// kv.mu.Unlock()
-
-				// HINT
-				// why don't use the current kv.db[op.Key] as in Lab3?
-				// kv.db may be modified between listener() send Op to ch and reading from here
-				// modified by what?
-				// eg: by updateInAndOutShard, a "new config" is processed by listener
-				//     and it found that in new config the current server doesn't in charge of the shard of op.Key anymore and deleted them from kv.db
-				//     but actually the "GET" op is commited by raft, so the value at that moment (which is not modified by any other process) should be returned
-				// so we use the value read in listener
-				reply.Value = appliedOp.Value
-				DPrintf(dInfo, dServer, kv, "Request: GET %v = %v", op.Key, appliedOp.Value)
-			}
-		}
-	case <-time.After(1 * time.Second):
-		DPrintf(dWarn, dServer, kv, "commit timeout: op %v", op)
+	if kvResult.CId != args.CId || kvResult.Seq != args.Seq {
+		// +CHECK: in what circumstance this will happen?
+		// +ANS: the original Op is not actually commited by raft
+		//       instead another Op commited by another raft server with the same index is sent to applyCh
 		reply.Err = ErrRetry
+	} else if executeResult.Err == ErrWrongGroup {
+		reply.Err = ErrWrongGroup
+	} else {
+		reply.Err = OK
+		if args.OpType == GET {
+			// HINT
+			// why don't use the current kv.db[op.Key] as in Lab3?
+			// kv.db may be modified between listener() send Op to ch and reading from here
+			// modified by what?
+			// eg: by updateInAndOutShard, a "new config" is processed by listener
+			//     and it found that in new config the current server doesn't in charge of the shard of op.Key anymore and deleted them from kv.db
+			//     but actually the "GET" op is commited by raft, so the value at that moment (which is not modified by any other process) should be returned
+			// so we use the value read in listener
+			reply.Value = kvResult.Value
+			DPrintf(dInfo, dServer, kv, "Request: GET %v = %v", args.Key, reply.Value)
+		}
 	}
-
-	kv.mu.Lock()
-	close(kv.idx2OpChan[index])
-	delete(kv.idx2OpChan, index)
-	kv.mu.Unlock()
 }
 
 func (kv *ShardKV) ShardMigration(args *MigrateArgs, reply *MigrateReply) {
@@ -231,13 +295,11 @@ func (kv *ShardKV) ShardMigration(args *MigrateArgs, reply *MigrateReply) {
 	for k, v := range kv.shardsToBePulled[args.ConfigNum][args.Shard] {
 		reply.DB[k] = v
 	}
-	// TODO: what if the current kv.cid2MaxSeq doesn't match the "toOutShards" of an old config?
+	// CHECK: what if the current kv.cid2MaxSeq doesn't match the "toOutShards" of an old config?
 	// (all toOutShards is stored in kv.toOutShards indexed by configNum)
 	for cid, maxSeqAndReply := range kv.cid2MaxSeqAndReply {
 		reply.CId2MaxSeqAndReply[cid] = maxSeqAndReply
 	}
-
-	// DPrintf(dInfo, dServer, kv, "ShardMigration done, reply: %+v", reply)
 }
 
 func (kv *ShardKV) GC(args *GcArgs, reply *GcReply) {
@@ -266,48 +328,16 @@ func (kv *ShardKV) GC(args *GcArgs, reply *GcReply) {
 	}
 	kv.mu.Unlock()
 
-	gcOp := GcOp{
-		ConfigNum: args.ConfigNum,
-		Shard:     args.Shard,
+	command := Command{
+		Type: GC,
+
+		Data: GcOp{
+			ConfigNum: args.ConfigNum,
+			Shard:     args.Shard,
+		},
 	}
-	DPrintf(dInfo, dServer, kv, "GC: staring Op: %+v", gcOp)
-	index, _, isLeader := kv.rf.Start(gcOp)
-	DPrintf(dInfo, dServer, kv, "GC: staring Op: %+v...done", gcOp)
-	if !isLeader {
-		DPrintf(dGC, dServer, kv, "GC failed, Args: %+v, ErrWrongLeader", args)
-		reply.Err = ErrWrongLeader
-		return
-	}
-
-	kv.mu.Lock()
-	kv.idx2OpChan[index] = make(chan KvOp)
-	ch := kv.idx2OpChan[index]
-	kv.mu.Unlock()
-	select {
-	case <-ch:
-		DPrintf(dGC, dServer, kv, "GC success, Args: %+v", args)
-		reply.Err = OK
-	case <-time.After(1 * time.Second):
-		DPrintf(dGC, dServer, kv, "GC failed, Args: %+v, ErrRetry(commit timeout)", args)
-		reply.Err = ErrRetry
-	}
-
-	// HINT
-	// DO NOT forget to close the channel and delete it from map, THEY ARE NECESSARY
-	// no close & delete => a silence deadlock
-	// only close => ok to run, but leave some garbage channel
-	// only delete => go panic: send to a closed channel
-
-	// because you may come here via a timeout instead of read something from the channel
-	// in some cases, the timeout happend and GC returned
-	// if the channel is not deleted from map then listener may write to a channel that will never be read then be stucked forever
-
-	// CHECK
-	// when the above case will happen
-	kv.mu.Lock()
-	close(kv.idx2OpChan[index])
-	delete(kv.idx2OpChan, index)
-	kv.mu.Unlock()
+	executeResult := kv.execute(command, true)
+	reply.Err = executeResult.Err
 }
 
 func (kv *ShardKV) applyConfig(config shardctrler.Config) {
@@ -521,96 +551,107 @@ func (kv *ShardKV) listener() {
 		// if op, ok := msg.Command.(Op); ok {
 		if msg.CommandValid {
 			commandIndex := msg.CommandIndex
-			if op, ok := msg.Command.(KvOp); ok {
-				kv.maxCommandIndex = max(kv.maxCommandIndex, commandIndex)
-				DPrintf(dInfo, dServer, kv, "Op [%v] is commited by raft, index: %v, kv.maxIndex: %v", op, commandIndex, kv.maxCommandIndex)
+			command := msg.Command.(Command)
+			executeResult := ExecuteResult{
+				Type: command.Type,
 
-				shard := key2shard(op.Key)
-				// shardIsOk, hasShard := kv.hasShard[shard]
-				// if !shardIsOk || !hasShard {
+				Err: OK,
+			}
+			switch command.Type {
+			case KVOP:
+				kv.maxCommandIndex = max(kv.maxCommandIndex, commandIndex)
+				kvOp := command.Data.(KvOp)
+				DPrintf(dInfo, dServer, kv, "listener: KvOp [%v] is commited by raft, index: %v, kv.maxIndex: %v", kvOp, commandIndex, kv.maxCommandIndex)
+
+				kvResult := KvResult{
+					CId: kvOp.CId,
+					Seq: kvOp.Seq,
+				}
+
+				shard := key2shard(kvOp.Key)
 				if shardStatus, ok := kv.shardsStatus[shard]; !ok || shardStatus != READY {
 					// double check whether the shard still belongs to this group after raft has commited the Op
 					// borrow the "Type" field to indicate that the shard no longer belongs to current group
-					op.Type = ErrWrongGroup
-					DPrintf(dWarn, dServer, kv, "listener: but I'm not in charge of shard %v (key: %v) now, my shards: %+v", shard, op.Key, kv.shardsStatus)
+					executeResult.Err = ErrWrongGroup
+					DPrintf(dWarn, dServer, kv, "listener: KvOp [%v] but I'm not in response of shard %v (key: %v) now, my shards: %+v", shard, kvOp.Key, kv.shardsStatus)
 				} else {
-					maxSeqAndReply, found := kv.cid2MaxSeqAndReply[op.CId]
+					maxSeqAndReply, found := kv.cid2MaxSeqAndReply[kvOp.CId]
 					maxSeq := maxSeqAndReply.Seq
-					if !found || op.Seq > maxSeq {
-						if op.Seq > maxSeqAndReply.Seq {
-							if op.Seq == maxSeqAndReply.Seq+1 {
-								DPrintf(dInfo, dServer, kv, "Op [%v] is executed by kv because op.Seq (%v) > kv.cid2MaxSeqAndReply[%v].Seq (%v)", op, op.Seq, op.CId, maxSeq)
+					if !found || kvOp.Seq > maxSeq {
+						if kvOp.Seq > maxSeqAndReply.Seq {
+							if kvOp.Seq == maxSeqAndReply.Seq+1 {
+								DPrintf(dInfo, dServer, kv, "listener: KvOp [%v] is executed by kv because op.Seq (%v) > kv.cid2MaxSeqAndReply[%v].Seq (%v)", kvOp, kvOp.Seq, kvOp.CId, maxSeq)
 							} else {
-								DPrintf(dError, dServer, kv, "!!! Op [%v] .seq (%v) != kv.cid2MaxSeqAndReply[%v].Seq (%v) + 1, Op may be lost", op, op.Seq, op.CId, maxSeq)
+								DPrintf(dWarn, dServer, kv, "listener: KvOp [%v] .seq (%v) != kv.cid2MaxSeqAndReply[%v].Seq (%v) + 1, Op may be lost", kvOp, kvOp.Seq, kvOp.CId, maxSeq)
 							}
 						} else {
-							DPrintf(dInfo, dServer, kv, "Op [%v] is executed by kv because op.CId (%v) is not found in kv.cid2MaxSeq (%v)", op, op.CId, kv.cid2MaxSeqAndReply)
+							DPrintf(dInfo, dServer, kv, "listener: KvOp [%v] is executed by kv because op.CId (%v) is not found in kv.cid2MaxSeq (%v)", kvOp, kvOp.CId, kv.cid2MaxSeqAndReply)
 						}
 
 						newMaxSeqAndReply := SeqAndReply{
-							Seq:  op.Seq,
-							Type: op.Type,
+							Seq:  kvOp.Seq,
+							Type: kvOp.Type,
 						}
-						switch op.Type {
+						switch kvOp.Type {
 						case PUT:
-							kv.db[op.Key] = op.Value
+							kv.db[kvOp.Key] = kvOp.Value
 						case APPEND:
-							kv.db[op.Key] += op.Value
-							DPrintf(dInfo, dServer, kv, "kv.db[%v] after appending %v: %v", op.Key, op.Value, kv.db[op.Key])
+							kv.db[kvOp.Key] += kvOp.Value
+							DPrintf(dInfo, dServer, kv, "listener: kv.db[%v] after appending %v: %v", kvOp.Key, kvOp.Value, kv.db[kvOp.Key])
 						case GET:
 							// get the latest value, as kv.db may be updated by MigrateReply
-							// again, borrow the "Value" failed
-							op.Value = kv.db[op.Key]
-							newMaxSeqAndReply.Value = op.Value
-							DPrintf(dInfo, dServer, kv, "listener: GET (%v): %v", op.Key, op.Value)
+							kvResult.Value = kv.db[kvOp.Key]
+							newMaxSeqAndReply.Value = kvResult.Value
+							DPrintf(dInfo, dServer, kv, "listener: GET (%v): %v", kvOp.Key, kvOp.Value)
 						}
-						kv.cid2MaxSeqAndReply[op.CId] = newMaxSeqAndReply
+						kv.cid2MaxSeqAndReply[kvOp.CId] = newMaxSeqAndReply
 					} else {
-						if op.Type == GET {
-							if maxSeq == op.Seq {
+						if kvOp.Type == GET {
+							if maxSeq == kvOp.Seq {
 								// -CHECK (TestUnreliable3)
 								// it seems that both maxSeqAndReply.Value and kv.db[op.Key] are ok here
 								// but in "Request()", only maxSeqAndReply.Value is ok
-								op.Value = maxSeqAndReply.Value
-								// op.Value = kv.db[op.Key]
-								DPrintf(dWarn, dServer, kv, "Op [%v] is duplicate GET, replied last Get value: curMaxSeqAndReply[%+v]: %v", op, op.CId, kv.cid2MaxSeqAndReply[op.CId])
+								kvResult.Value = maxSeqAndReply.Value
+								// executeResult.Value = kv.db[kvOp.Key]
+								DPrintf(dWarn, dServer, kv, "listener: KvOp [%v] is duplicate GET, replied last Get value: curMaxSeqAndReply[%+v]: %v", kvOp, kvOp.CId, kv.cid2MaxSeqAndReply[kvOp.CId])
 							} else {
 								// -CHECK
 								// what if maxSeq < op.Seq
-								DPrintf(dError, dServer, kv, "Op [%v] is duplicate GET, replied last Geted value: curMaxSeqAndReply[%+v]: %v", op, op.CId, kv.cid2MaxSeqAndReply[op.CId])
+								DPrintf(dError, dServer, kv, "listener: KvOp [%v] is duplicate GET, replied last Geted value: curMaxSeqAndReply[%+v]: %v", kvOp, kvOp.CId, kv.cid2MaxSeqAndReply[kvOp.CId])
 							}
 						} else {
 							// -CHECK, HINT
 							// so the duplicate PUT or APPEND should be just ignored?
-							DPrintf(dWarn, dServer, kv, "Op [%v] is not executed by kv, curMaxSeqAndReply[%v]: %v", op, op.CId, kv.cid2MaxSeqAndReply[op.CId])
+							DPrintf(dWarn, dServer, kv, "listener: KvOp [%v] is not executed by kv, curMaxSeqAndReply[%v]: %v", kvOp, kvOp.CId, kv.cid2MaxSeqAndReply[kvOp.CId])
 						}
 					}
 				}
-
-				if _, ok := kv.idx2OpChan[commandIndex]; ok {
-					kv.idx2OpChan[commandIndex] <- op
-				} else {
-					// current server is the follower, and received "appended entry" from the leader
-					// so there is no corresponding channel of the index
-					// DPrintf(dError, dServer, kv.me, "kv.idx2OpChan[index(%v)] does not exist", index)
-				}
-			} else if config, ok := msg.Command.(shardctrler.Config); ok {
+				executeResult.Data = kvResult
+			case CONFIGURATION:
+				config := command.Data.(shardctrler.Config)
 				kv.applyConfig(config)
-				// DPrintf(dCONF, dServer, kv, "new config is received from applyCh, outShard: %v, inShards: %v", kv.shardsToBePulled, kv.shardsToPull2ConfigNum)
-				DPrintf(dCONF, dServer, kv, "new config is received from applyCh")
-			} else if migrateReply, ok := msg.Command.(MigrateReply); ok {
+				executeResult.Err = OK
+				DPrintf(dCONF, dServer, kv, "listener: CONF new config %+v is received from applyCh\n\toutShard: %v\n\tinShards: %v", config, kv.shardsToBePulled, kv.shardsToPull2ConfigNum)
+				// DPrintf(dCONF, dServer, kv, "new config is received from applyCh")
+			case INSERTSHARD:
+				migrateReply := command.Data.(MigrateReply)
 				kv.applyMigratedShard(migrateReply)
-				// DPrintf(dMIGA, dServer, kv, "MigrateReply is received from applyCh and applied, reply: %+v, kv.db: %+v", migrateReply, kv.db)
-				DPrintf(dMIGA, dServer, kv, "MigrateReply is received from applyCh and applied")
-			} else if gcOp, ok := msg.Command.(GcOp); ok {
-				commandIndex := msg.CommandIndex
+				executeResult.Err = OK
+				DPrintf(dMIGA, dServer, kv, "listener: MigrateReply is received from applyCh and applied\n\treply: %+v\n\tkv.db: %+v", migrateReply, kv.db)
+				// DPrintf(dMIGA, dServer, kv, "MigrateReply is received from applyCh and applied")
+			case GC:
+				gcOp := command.Data.(GcOp)
 				kv.applyGc(gcOp)
-				DPrintf(dGC, dServer, kv, "listener: GcRequest %+v has been executed", gcOp)
-				if _, ok := kv.idx2OpChan[commandIndex]; ok {
-					op := KvOp{}
-					kv.idx2OpChan[commandIndex] <- op
+				executeResult.Err = OK
+				DPrintf(dGC, dServer, kv, "listener: GcOp %+v has been executed", gcOp)
+			case EMPTYENTRY:
+
+			}
+
+			if _, ok := kv.idx2NotifyChan[commandIndex]; ok {
+				if currentTerm, isLeader := kv.rf.GetState(); isLeader && currentTerm == msg.CommandTerm {
+					kv.idx2NotifyChan[commandIndex] <- executeResult
 				}
-				DPrintf(dGC, dServer, kv, "listener: GcRequest %+v has been executed...and notified GC", gcOp)
 			}
 
 			// HINT (TestChallenge1Delete)
@@ -642,6 +683,7 @@ func (kv *ShardKV) updateConfig() {
 	_, isLeader := kv.rf.GetState()
 	kv.mu.Lock()
 	if !isLeader || len(kv.shardsToPull2ConfigNum) > 0 {
+		DPrintf(dCONF, dServer, kv, "updateConfig: but I can't pull new config now, isLeader: %v, len(shardsToPull): %v", isLeader, len(kv.shardsToPull2ConfigNum))
 		kv.mu.Unlock()
 		return
 	}
@@ -658,11 +700,16 @@ func (kv *ShardKV) updateConfig() {
 	// the server may miss any config change
 	newConfig := kv.sc.Query(targetConfigNum)
 	kv.mu.Lock()
-	// if newConfig.Num > kv.config.Num {
 	if newConfig.Num == kv.config.Num+1 {
-		DPrintf(dCONF, dServer, kv, "new config is found and put to raft:\n\told config: %+v,\n\tnew config: %+v", kv.config, newConfig)
-		kv.rf.Start(newConfig)
-		DPrintf(dCONF, dServer, kv, "new config is found and put to raft:\n\told config: %+v,\n\tnew config: %+v\n\t...done", kv.config, newConfig)
+		kv.mu.Unlock()
+		command := Command{
+			Type: CONFIGURATION,
+
+			Data: newConfig,
+		}
+		kv.execute(command, false)
+		DPrintf(dCONF, dServer, kv, "updateConfig: new config is found and put to raft:\n\told config: %+v,\n\tnew config: %+v\n\t...done", kv.config, newConfig)
+		return
 	}
 	kv.mu.Unlock()
 }
@@ -706,9 +753,18 @@ func (kv *ShardKV) pullShard() {
 				// and the server won't serve the request related to that shard, so everything is ok
 				// if ok && reply.Err == OK {
 				if reply.Err == OK {
-					kv.rf.Start(reply)
-					// if anyone is OK, the stop asking for others
-					break
+					// CHECK: what if isLeader is false?
+					// kv.rf.Start(reply)
+					command := Command{
+						Type: INSERTSHARD,
+
+						Data: reply,
+					}
+					executeResult := kv.execute(command, false)
+					if executeResult.Err == OK {
+						// if anyone is OK, the stop asking for others
+						break
+					}
 				} else {
 					DPrintf(dMIGA, dServer, kv, "pullShard: failed to call ShardMigration to %v, args: %+v, Call.ok: %v, reply.Err: %+v", server, args, ok, reply.Err)
 				}
@@ -722,7 +778,7 @@ func (kv *ShardKV) pullShard() {
 func (kv *ShardKV) checkGarbage() {
 	defer DPrintf(dInfo, dServer, kv, "checkGarbage: done")
 	if _, isLeader := kv.rf.GetState(); !isLeader {
-		DPrintf(dWarn, dServer, kv, "checkGarbage: garbages: %+v, but I'm not the leader", kv.garbages)
+		// DPrintf(dWarn, dServer, kv, "checkGarbage: garbages: %+v, but I'm not the leader", kv.garbages)
 		return
 	}
 
@@ -755,6 +811,15 @@ func (kv *ShardKV) checkGarbage() {
 	}
 	kv.mu.Unlock()
 	wait.Wait()
+}
+
+func (kv *ShardKV) putEmptyLog() {
+	if !kv.rf.HasLogInCurrentTerm() {
+		kv.execute(Command{
+			Type: EMPTYENTRY,
+			Data: nil,
+		}, true)
+	}
 }
 
 func (kv *ShardKV) daemon(do func(), sleepMs int) {
@@ -808,6 +873,7 @@ func (kv *ShardKV) Kill() {
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
+	labgob.Register(Command{})
 	labgob.Register(KvOp{})
 	labgob.Register(shardctrler.Config{})
 	labgob.Register(MigrateReply{})
@@ -832,7 +898,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.dead = 0
 
 	kv.db = make(map[string]string)
-	kv.idx2OpChan = make(map[int]chan KvOp)
+	kv.idx2NotifyChan = make(map[int]chan ExecuteResult)
 	kv.cid2MaxSeqAndReply = make(map[int]SeqAndReply)
 
 	kv.shardsToBePulled = make(map[int]map[int]map[string]string)
@@ -872,6 +938,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.daemon(kv.updateConfig, 10)
 	go kv.daemon(kv.pullShard, 10)
 	go kv.daemon(kv.checkGarbage, 100)
+	go kv.daemon(kv.putEmptyLog, 100)
 
 	return kv
 }

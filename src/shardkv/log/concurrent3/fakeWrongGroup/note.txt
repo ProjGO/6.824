@@ -1,0 +1,36 @@
+line 260
+    leader 100:0 收到请求 2207 3 get 2
+之后可能网断了,这个Op一直没有被raft commited,直到
+
+line 1487
+    100:0发现这个Get被commit了,并且在listener中向request返回了这个Get的结果
+    此时100:0应该还是leader,所以会向client发送reply
+    但是网断了,client并没有收到这个reply
+line 1491
+    100:2也收到了这个Get
+
+line 1495
+    100:0从applyCh中收到了新的config,并进行了apply,改变了shardsStatus,并不再服务key 2所在的shard
+    并将这个config同步给了100:1和100:0
+
+某个时刻起100:1成为了leader,并已经被更新成了新的config
+
+line 1616
+    由于之前client没有收到100:0给的reply,所以还在发get request,此时leader已经换成了100:1
+    100:1收到了request,但是发现自己已经不再服务key 2的shard了,所以返回了WrongGroup
+
+之后再也没有哪个server的listener中收到过GET 2
+
+问题:
+    就算是假的ErrWrongGroup,那Client就不会query一下config然后再试着问真的那个?
+    而且为什么会get到并且返回空值
+
+Solve:
+    首先Client的实现有问题,轮询那里写得不对
+    而且Server这边处理duplicate get的方法也有问题
+        应该是记住最后一个get的返回结果,然后遇到重复的get直接返回记住的这个值
+        而不是从kv.db中读取
+            但就算是从kv.db中读,也不应该返回空值
+            待检查.
+    但现在貌似不会再出现这个问题了
+    

@@ -1,0 +1,13 @@
+有时候listener中会有
+    Op.Seq > MaxOp.Seq + 1的情况
+    而且[MaxOp.Seq + 1, Op.Seq]的那些Op确实丢了,比如append的话就会少这几个Op append的东西
+
+原因:
+    因为listener中判断Msg种类的if-else写得有问题
+    直接用 _, ok := msg.Command.([]byte)来判断Snapshot了
+    然而实际上msg有两个字段,Command(Op, config, MigrateReply)用Command,Snapshot用Snapsho
+    所以实际上所有的Snapshot根本就没有被shardkv apply
+    
+    就是说在正常的情况下
+    Op.Seq > MaxOp.Seq + 1是可以发生的,因为中间的那些Op已经被包含在上一个Snapshot,所以不实际执行这些Op也不会丢失
+    但不apply snapshot的话就会有问题

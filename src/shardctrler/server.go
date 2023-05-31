@@ -56,6 +56,7 @@ func (sc *ShardCtrler) Request(args *Args, reply *Reply) {
 	if _, ok := sc.curMaxSeq[args.CId]; !ok {
 		sc.curMaxSeq[args.CId] = -1
 	}
+	// to process duplicate request
 	if args.Seq <= sc.curMaxSeq[args.CId] {
 		DPrintf(dWarn, dServer, sc.me, "but args.Seq (%v) <= curMaxSeq[%v] (%v), req is not executed", args.Seq, args.CId, sc.curMaxSeq[args.CId])
 		reply.Err = OK
@@ -79,6 +80,13 @@ func (sc *ShardCtrler) Request(args *Args, reply *Reply) {
 	}
 
 	sc.mu.Lock()
+	// to make fast respond to Query request
+	if args.OpType == QUERY && args.Num >= 0 && args.Num < len(sc.configs) {
+		reply.Err = OK
+		reply.Config = sc.configs[args.Num]
+		sc.mu.Unlock()
+		return
+	}
 	sc.idx2OpChan[index] = make(chan Args)
 	ch := sc.idx2OpChan[index]
 	sc.mu.Unlock()

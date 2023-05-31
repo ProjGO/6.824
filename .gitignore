@@ -6,3 +6,4 @@ src/raft/log/*
 src/raft/manyLog/*
 src/kvraft/manyLog/*
 src/shardctrler/manyLog/*
+src/shardkv/manyLog/*
